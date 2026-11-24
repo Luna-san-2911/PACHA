@@ -2,6 +2,8 @@ import gzip
 import importlib.machinery
 import importlib.util
 import json
+import os
+import shlex
 import pathlib
 import tempfile
 import unittest
@@ -29,6 +31,7 @@ class PipelineTests(unittest.TestCase):
         for name in ("a.fa", "b.fa"):
             (self.genomes / name).write_text(">chr1\nACGT\n>chr2\nTGCA\n")
         self.argv = ["-m", "graph", "-r", str(self.reads), "-g", str(self.genomes),
+                     "-ref", str(self.genomes / "a.fa"),
                      "-t", "32", "-a", "2", "-at", "8", "-o", str(self.root / "out")]
 
     def test_dry_run_no_writes(self):
@@ -45,6 +48,8 @@ class PipelineTests(unittest.TestCase):
             self.assertIn("--array=0-2%2", cmd)
             self.assertIn("--cpus-per-task=8", cmd)
             self.assertIn("--dependency=afterok:123", cmd)
+        self.assertEqual(jobs[0][1:4], (2, 8, 1))
+        self.assertTrue(jobs[0][-1])
         self.assertEqual(jobs[1][1:4], (2, 1, 32))
 
     def test_ambiguous_mates(self):
@@ -65,11 +70,91 @@ class PipelineTests(unittest.TestCase):
     def test_chromosome_mismatch(self):
         (self.genomes / "b.fa").write_text(">chr3\nACGT\n")
         with self.assertRaises(ValueError):
-            p.discover_genomes(self.genomes, None)
+            p.discover_genomes(self.genomes, self.genomes / "a.fa", validate_all=True)
 
     def test_reference_selection(self):
-        args = p.parser().parse_args(self.argv + ["--reference", "b.fa"])
-        self.assertEqual(p.configuration(args)["reference_index"], 1)
+        args = p.parser().parse_args(self.argv + ["--reference", str(self.genomes / "b.fa")])
+        cfg = p.configuration(args)
+        self.assertEqual(cfg["reference_index"], 1)
+        self.assertEqual(len(cfg["genomes"]), 2)
+        self.assertEqual(cfg["genomes"][1]["path"], str(self.genomes / "b.fa"))
+
+    def test_reference_required(self):
+        argv = self.argv.copy()
+        idx = argv.index("-ref")
+        del argv[idx:idx+2]
+        with self.assertRaises(SystemExit):
+            p.parser().parse_args(argv)
+
+    def test_external_reference(self):
+        ref = self.root / "reference.fa"
+        ref.write_text(">chr2\nAAAA\n>chr1\nCCCC\n")
+        args = p.parser().parse_args(self.argv + ["-ref", str(ref)])
+        cfg = p.configuration(args)
+        self.assertEqual(len(cfg["genomes"]), 3)
+        self.assertEqual(cfg["genomes"][cfg["reference_index"]]["path"], str(ref))
+        self.assertEqual(cfg["chromosomes"], ["chr2", "chr1"])
+        self.assertEqual(p.jobs(args, cfg)[0][1], 3)
+
+    def test_external_reference_alias_not_duplicated(self):
+        ref = self.root / "reference.fa"
+        os.link(self.genomes / "a.fa", ref)
+        records, index, _ = p.discover_genomes(self.genomes, ref)
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[index]["path"], str(ref))
+
+    def test_large_panel_and_array_batches(self):
+        for i in range(1001):
+            (self.genomes / f"genome{i:04d}.fa").write_text(">chr1\nACGT\n>chr2\nTGCA\n")
+        args = p.parser().parse_args(self.argv)
+        cfg = p.configuration(args)
+        self.assertEqual(len(cfg["genomes"]), 1003)
+        self.assertEqual(len({g["id"] for g in cfg["genomes"]}), 1003)
+        batches = [(j, offset) for j, offset in p.job_batches(args, cfg) if j[0] == "prepare"]
+        self.assertEqual([(j[1], offset) for j, offset in batches], [(1000, 0), (3, 1000)])
+        cmd = p.submit_command(args, cfg, batches[1][0], ROOT / "PACHA",
+                               self.root / "manifest", "100", batches[1][1])
+        self.assertIn("--array=0-2%3", cmd)
+        self.assertEqual(shlex.split(cmd[-1])[-1], "1000")
+        self.assertIn("--dependency=afterok:100", cmd)
+
+    def test_prepare_uses_selected_reference_only(self):
+        args = p.parser().parse_args(self.argv + ["-ref", str(self.genomes / "b.fa")])
+        cfg = p.configuration(args)
+        def fake_index(cmd, **kwargs):
+            self.assertEqual(cmd[:2], ["samtools", "faidx"])
+            pathlib.Path(str(cmd[2]) + ".fai").write_text("chr1\t4\t6\t4\t5\nchr2\t4\t17\t4\t5\n")
+        with patch.object(p, "run", side_effect=fake_index):
+            for i in range(len(cfg["genomes"])):
+                work = p.stage_dir(cfg, "prepare", i)
+                work.mkdir(parents=True)
+                files = p.prepare(cfg, work, i, 1)
+                p.atomic_json(work / ".complete.json", {"files": {f: (work / f).stat().st_size for f in files}})
+                self.assertEqual((work / "reference.fa").exists(), i == cfg["reference_index"])
+        reference = p.reference_inputs(cfg)
+        self.assertEqual(reference, p.stage_dir(cfg, "prepare", cfg["reference_index"]))
+        self.assertEqual((reference / "reference.fa").read_text(), (self.genomes / "b.fa").read_text())
+
+    def test_finish_two_haplotypes_per_individual(self):
+        cfg = p.configuration(p.parser().parse_args(self.argv))
+        for i, sample in enumerate(cfg["samples"]):
+            work = p.stage_dir(cfg, "consensus", i)
+            work.mkdir(parents=True)
+            p.atomic_json(work / "summary.json", {
+                "sample": sample["name"], "records": 1, "phased_heterozygous": 1,
+                "homozygous": 0, "unphased_heterozygous": 0,
+                "missing_or_nondiploid": 0, "selected_fraction": 1.0})
+            for h in (1, 2):
+                for suffix in ("", ".fai", ".gzi"):
+                    (work / f"{sample['name']}_hap{h}.fa.gz{suffix}").write_text("test")
+            p.atomic_json(work / ".complete.json", {"files": {
+                f.name: f.stat().st_size for f in work.iterdir() if f.is_file()}})
+        final = self.root / "final"
+        final.mkdir()
+        p.finish(cfg, final, 0, 1)
+        self.assertEqual(sorted(f.name for f in final.glob("*.fa.gz")), [
+            f"{s['name']}_hap{h}.fa.gz" for s in cfg["samples"] for h in (1, 2)])
+        self.assertTrue((final / "_SUCCESS").is_file())
 
     def test_vcf_mode_rejected(self):
         argv = list(self.argv)

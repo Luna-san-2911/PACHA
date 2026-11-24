@@ -15,7 +15,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 TOOLS = ("pggb", "odgi", "vg", "samtools", "bcftools", "bgzip", "whatshap")
 FASTA = re.compile(r"\.(?:fa|fasta|fna)(?:\.gz)?$", re.I)
 FASTQ = re.compile(r"^(.*?)(?:_R([12])(?:_001)?|_([123]))(?:\.trimmed)?\.(?:fastq|fq)(?:\.gz)?$", re.I)
@@ -122,28 +122,43 @@ def discover_reads(directory):
     return result
 
 
-def discover_genomes(directory, reference):
+def discover_genomes(directory, reference, validate_all=False):
+    # -ref is an explicit FASTA, whether inside or outside -g. Compare
+    # device/inode as well as resolved paths to catch symlinks and hardlinks.
+    require(reference is not None, "An explicit -ref FASTA is required")
+    ref_path = Path(reference).expanduser().resolve(strict=True)
+    require(FASTA.search(ref_path.name), f"Reference must be a FASTA (.fa/.fasta/.fna, optionally .gz): {ref_path}")
+    ref_record = fingerprint(ref_path)
     files = sorted(p for p in Path(directory).iterdir() if p.is_file() and FASTA.search(p.name))
-    require(len(files) >= 2, "Graph mode requires at least two chromosome-level haplotype FASTAs")
-    records = [fingerprint(p) for p in files]
-    require(len({r["path"] for r in records}) == len(records), "Duplicate genome input")
-    if reference:
-        ref = Path(reference).expanduser()
-        if not ref.is_absolute() and not ref.is_file():
-            ref = Path(directory) / ref
-        ref = str(ref.resolve(strict=True))
-        require(ref in [r["path"] for r in records], "--reference must name one of the genome FASTAs")
-        ref_index = [r["path"] for r in records].index(ref)
-    else:
-        ref_index = 0
-    chromosomes = headers(records[ref_index]["path"])
-    for i, rec in enumerate(records):
-        if i != ref_index:
-            other = headers(rec["path"])
-            require(set(other) == set(chromosomes),
-                    f"Chromosome names differ in {rec['path']}; missing={sorted(set(chromosomes)-set(other))}, extra={sorted(set(other)-set(chromosomes))}")
-    # Each FASTA is an independently observed haplotype path. Stable synthetic IDs
-    # avoid PanSN collisions, even when input filenames contain spaces or '#'.
+    require(files, f"No genome FASTAs found in {directory}")
+    ref_stat = ref_path.stat()
+    ref_key = (ref_stat.st_dev, ref_stat.st_ino)
+    records, seen = [], set()
+    ref_index = None
+    for path in files:
+        record = fingerprint(path)
+        st = Path(record["path"]).stat()
+        key = (st.st_dev, st.st_ino)
+        require(key not in seen, f"Duplicate genome file or alias: {path}")
+        seen.add(key)
+        if key == ref_key:
+            ref_index = len(records)
+            record = dict(ref_record)
+        records.append(record)
+    if ref_index is None:
+        ref_index = len(records)
+        records.append(ref_record)
+    require(len(records) >= 2, "Graph mode requires the reference and at least one additional haplotype FASTA")
+    chromosomes = headers(ref_record["path"])
+    # Large panels are validated in parallel by preparation workers instead
+    # of reading every multi-gigabyte FASTA on the login node. An optional
+    # exhaustive header preflight remains available.
+    if validate_all:
+        for i, rec in enumerate(records):
+            if i != ref_index:
+                other = headers(rec["path"])
+                require(set(other) == set(chromosomes),
+                        f"Chromosome names differ in {rec['path']}; missing={sorted(set(chromosomes)-set(other))}, extra={sorted(set(other)-set(chromosomes))}")
     for i, rec in enumerate(records, 1):
         rec["id"] = f"G{i:04d}"
     return records, ref_index, chromosomes
@@ -159,7 +174,14 @@ def parser():
     p.add_argument("-a", "--array", type=positive, default=4, help="Maximum concurrent sample tasks")
     p.add_argument("-at", "--array-threads", type=positive, default=8, help="CPUs per sample task")
     p.add_argument("-o", "--output", type=Path, required=True)
-    p.add_argument("--reference", help="Genome FASTA filename or path; default first filename in sorted order")
+    p.add_argument("-ref", "--reference", type=Path, required=True,
+                   help="Reference FASTA path; included in the graph once and used as the VCF/consensus backbone")
+    p.add_argument("--prepare-parallel", type=positive, default=8, help="Concurrent source FASTA preparation tasks")
+    p.add_argument("--prepare-mem", default="16G", help="Memory per FASTA preparation task")
+    p.add_argument("--array-batch-size", type=positive, default=1000,
+                   help="Maximum tasks per SLURM array submission; larger panels are split into dependent batches")
+    p.add_argument("--validate-genomes", action="store_true",
+                   help="Scan every source FASTA for chromosome header compatibility before submission (slow on large panels)")
     p.add_argument("--graph-parallel", type=positive, default=1, help="Concurrent chromosome PGGB tasks")
     p.add_argument("--partition")
     p.add_argument("--account")
@@ -172,7 +194,7 @@ def parser():
     p.add_argument("--consensus-mem", default="16G")
     p.add_argument("--graph-time", default="48:00:00")
     p.add_argument("--sample-time", default="72:00:00")
-    p.add_argument("--dry-run", action="store_true", help="Validate input layout and print plan without writing or submitting")
+    p.add_argument("--dry-run", action="store_true", help="Validate input layout and reference headers; print plan without writing or submitting")
     # Same scientific defaults as the original graph workflow.
     p.add_argument("--segment-length", type=positive, default=20000)
     p.add_argument("--mapping-identity", type=float, default=90)
@@ -201,7 +223,7 @@ def configuration(args):
     out = args.output.expanduser().resolve()
     require(out != r and out != g and not out.is_relative_to(r) and not out.is_relative_to(g),
             "Output must be outside the input directories")
-    genomes, ref, chromosomes = discover_genomes(g, args.reference)
+    genomes, ref, chromosomes = discover_genomes(g, args.reference, args.validate_genomes)
     samples = discover_reads(r)
     options = {k: getattr(args, k) for k in ("segment_length", "mapping_identity", "poa_preset",
         "min_match", "poa_length", "poa_padding", "min_aln_identity", "min_mapq",
@@ -213,7 +235,7 @@ def configuration(args):
 
 def jobs(args, cfg):
     return [
-        ("prepare", 1, 1, 1, "16G", args.graph_time, False),
+        ("prepare", len(cfg["genomes"]), args.prepare_parallel, 1, args.prepare_mem, args.graph_time, True),
         ("graph", len(cfg["chromosomes"]), args.graph_parallel, args.threads, args.graph_mem, args.graph_time, True),
         ("index", 1, 1, args.threads, args.index_mem, args.graph_time, False),
         ("align", len(cfg["samples"]), args.array, args.array_threads, args.align_mem, args.sample_time, True),
@@ -228,7 +250,7 @@ def job_prefix(cfg):
     return "pacha-" + hashlib.sha256(cfg["output"].encode()).hexdigest()[:12] + "-"
 
 
-def submit_command(args, cfg, job, worker, manifest, parent=None):
+def submit_command(args, cfg, job, worker, manifest, parent=None, offset=0):
     stage, count, parallel, cpus, mem, duration, array = job
     prefix = job_prefix(cfg)
     log = Path(cfg["output"]) / "logs" / (stage + ("-%A_%a" if array else "-%j") + ".log")
@@ -243,8 +265,17 @@ def submit_command(args, cfg, job, worker, manifest, parent=None):
         cmd.append(f"--array=0-{count-1}%{min(count, parallel)}")
     if parent:
         cmd += ["--dependency=afterok:" + parent, "--kill-on-invalid-dep=yes"]
-    cmd += ["--wrap", shlex.join([sys.executable, str(worker), "_worker", str(manifest), stage, str(cpus)])]
+    cmd += ["--wrap", shlex.join([sys.executable, str(worker), "_worker", str(manifest), stage, str(cpus), str(offset)])]
     return cmd
+
+
+def job_batches(args, cfg):
+    """Split arrays into local indices plus a global offset, preserving barriers."""
+    for job in jobs(args, cfg):
+        stage, count, parallel, cpus, mem, duration, array = job
+        limit = args.array_batch_size if array else count
+        for offset in range(0, count, limit):
+            yield (stage, min(limit, count-offset), parallel, cpus, mem, duration, array), offset
 
 
 def active_jobs(cfg):
@@ -258,14 +289,19 @@ def print_plan(args, cfg):
     print(f"PACHA {VERSION} | graph | {len(cfg['genomes'])} haplotypes | {len(cfg['chromosomes'])} chromosomes | {len(cfg['samples'])} samples")
     print("Reference:", cfg["genomes"][cfg["reference_index"]]["path"])
     print("Output:", cfg["output"])
-    for stage, n, simultaneous, cpus, mem, duration, _ in jobs(args, cfg):
-        print(f"  {stage:12s} tasks={n:<5d} concurrent={min(n,simultaneous):<4d} CPUs/task={cpus:<4d} memory={mem} time={duration}")
+    for stage, n, simultaneous, cpus, mem, duration, array in jobs(args, cfg):
+        batches = (n + args.array_batch_size - 1) // args.array_batch_size if array else 1
+        effective = min(n, simultaneous, args.array_batch_size) if array else 1
+        print(f"  {stage:12s} tasks={n:<5d} concurrent={effective:<4d} batches={batches:<4d} CPUs/task={cpus:<4d} memory={mem} time={duration}")
+    print(f"Expected final FASTAs: {2 * len(cfg['samples'])} (hap1 + hap2 per individual)")
+    if not args.validate_genomes:
+        print("Source FASTA chromosome validation will run in parallel on compute nodes.")
 
 
 def stage_dir(cfg, stage, index=0):
     root = Path(cfg["output"])
     if stage == "prepare":
-        return root / "00_inputs"
+        return root / "00_inputs" / cfg["genomes"][index]["id"]
     if stage == "graph":
         return root / "01_graph" / cfg["chromosomes"][index]
     if stage == "index":
@@ -312,6 +348,7 @@ def normalize_fasta(source, dest):
     pending = ""
     count = 0
     started = False
+    seen = set()
     with open_text(source) as inp, open(dest, "w") as out:
         for line in inp:
             if line.startswith(">"):
@@ -319,7 +356,11 @@ def normalize_fasta(source, dest):
                     require(count > 0, f"Empty FASTA record in {source}")
                     if pending:
                         out.write(pending + "\n")
-                out.write(">" + line[1:].split()[0] + "\n")
+                parts = line[1:].split()
+                require(parts and SAFE.fullmatch(parts[0]), f"Invalid FASTA header in {source}: {line.strip()}")
+                require(parts[0] not in seen, f"Duplicate chromosome {parts[0]} in {source}")
+                seen.add(parts[0])
+                out.write(">" + parts[0] + "\n")
                 pending, count, started = "", 0, True
             elif line.strip():
                 require(started, f"Sequence before header in {source}")
@@ -347,28 +388,35 @@ def check_fai(fasta, chromosomes):
 
 
 def prepare(cfg, work, index, threads):
-    files = []
-    for genome in cfg["genomes"]:
-        check_fingerprint({k: genome[k] for k in ("path", "size", "mtime_ns")})
-        name = genome["id"] + ".fa"
-        normalize_fasta(genome["path"], work / name)
-        check_fai(work / name, cfg["chromosomes"])
-        files += [name, name + ".fai"]
-    chosen = cfg["genomes"][cfg["reference_index"]]["id"] + ".fa"
-    os.link(work / chosen, work / "reference.fa")
-    shutil.copyfile(work / (chosen + ".fai"), work / "reference.fa.fai")
-    (work / "reference_paths.txt").write_text("\n".join(cfg["chromosomes"]) + "\n")
-    return files + ["reference.fa", "reference.fa.fai", "reference_paths.txt"]
+    genome = cfg["genomes"][index]
+    source = {k: genome[k] for k in ("path", "size", "mtime_ns")}
+    check_fingerprint(source)
+    fasta = work / "genome.fa"
+    normalize_fasta(genome["path"], fasta)
+    check_fai(fasta, cfg["chromosomes"])
+    check_fingerprint(source)
+    files = ["genome.fa", "genome.fa.fai"]
+    if index == cfg["reference_index"]:
+        os.link(fasta, work / "reference.fa")
+        shutil.copyfile(work / "genome.fa.fai", work / "reference.fa.fai")
+        (work / "reference_paths.txt").write_text("\n".join(cfg["chromosomes"]) + "\n")
+        files += ["reference.fa", "reference.fa.fai", "reference_paths.txt"]
+    return files
+
+
+def reference_inputs(cfg):
+    """The sole prepared reference used by every downstream stage."""
+    return completed(cfg, "prepare", cfg["reference_index"])
 
 
 def graph(cfg, work, index, threads):
-    prep = completed(cfg, "prepare")
     chr_name = cfg["chromosomes"][index]
     opts = cfg["options"]
     fasta = work / "haplotypes.fa"
     with open(fasta, "wb") as out:
-        for genome in cfg["genomes"]:
-            cmd = ["samtools", "faidx", str(prep / (genome["id"] + ".fa")), chr_name]
+        for i, genome in enumerate(cfg["genomes"]):
+            prepared = completed(cfg, "prepare", i)
+            cmd = ["samtools", "faidx", str(prepared / "genome.fa"), chr_name]
             with subprocess.Popen(cmd, stdout=subprocess.PIPE) as proc:
                 header = proc.stdout.readline()
                 require(header.startswith(b">"), f"Missing extracted chromosome: {chr_name}")
@@ -416,7 +464,7 @@ def vcf_check(vcf, ref, chromosomes, sample=None, nonempty=True):
 
 
 def index_graph(cfg, work, index, threads):
-    prep = completed(cfg, "prepare")
+    prep = reference_inputs(cfg)
     paths = [completed(cfg, "graph", i) / "graph.og" for i in range(len(cfg["chromosomes"]))]
     (work / "graphs.txt").write_text("\n".join(map(str, paths)) + "\n")
     run(["odgi", "squeeze", "-f", work / "graphs.txt", "-o", work / "merged.og", "-t", threads, "-P"])
@@ -477,7 +525,7 @@ def align(cfg, work, index, threads):
 
 
 def call(cfg, work, index, threads):
-    prep = completed(cfg, "prepare")
+    prep = reference_inputs(cfg)
     gbz = indexes(completed(cfg, "index"))[0]
     aln = completed(cfg, "align", index)
     sample = cfg["samples"][index]["name"]
@@ -499,7 +547,7 @@ def call(cfg, work, index, threads):
 
 
 def phase(cfg, work, index, threads):
-    prep = completed(cfg, "prepare")
+    prep = reference_inputs(cfg)
     gbz = indexes(completed(cfg, "index"))[0]
     aln = completed(cfg, "align", index)
     variants = completed(cfg, "call", index) / "filtered.vcf.gz"
@@ -563,7 +611,7 @@ def select_consensus_variants(source, destination):
 
 
 def consensus(cfg, work, index, threads):
-    prep = completed(cfg, "prepare")
+    prep = reference_inputs(cfg)
     ph = completed(cfg, "phase", index)
     sample = cfg["samples"][index]["name"]
     counts = select_consensus_variants(ph / "phased.vcf.gz", work / "consensus.vcf")
@@ -615,12 +663,13 @@ def finish(cfg, work, index, threads):
 WORKERS = dict(zip(STAGES, (prepare, graph, index_graph, align, call, phase, consensus, finish)))
 
 
-def worker(manifest, stage, threads):
+def worker(manifest, stage, threads, offset=0):
     cfg = load(manifest)
     require(sha(__file__) == cfg["code_sha256"], "Worker snapshot differs from manifest")
-    index = int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
-    if stage in ("graph", "align", "call", "phase", "consensus"):
-        limit = len(cfg["chromosomes"] if stage == "graph" else cfg["samples"])
+    index = offset + int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
+    if stage in ("prepare", "graph", "align", "call", "phase", "consensus"):
+        limit = len(cfg["genomes"] if stage == "prepare" else
+                    cfg["chromosomes"] if stage == "graph" else cfg["samples"])
         require(0 <= index < limit, "Array index out of range")
     else:
         index = 0
@@ -687,15 +736,15 @@ def launch(args):
         journal = state / "jobs.json"
         # Arrays use stage-wide afterok barriers, so the requested sample
         # concurrency is never multiplied across alignment/call/phasing.
-        for job in jobs(args, cfg):
-            cmd = submit_command(args, cfg, job, snapshot, manifest, parent)
+        for job, offset in job_batches(args, cfg):
+            cmd = submit_command(args, cfg, job, snapshot, manifest, parent, offset)
             reply = subprocess.check_output(cmd, text=True).strip()
             ident = reply.split(";", 1)[0]
             require(re.fullmatch(r"\d+", ident), f"Unexpected sbatch reply: {reply}")
             parent = ident
-            submitted.append({"stage": job[0], "job_id": ident, "command": cmd})
+            submitted.append({"stage": job[0], "job_id": ident, "offset": offset, "task_count": job[1], "command": cmd})
             atomic_json(journal, submitted)
-            print(f"Submitted {job[0]}: {ident}", flush=True)
+            print(f"Submitted {job[0]} (tasks {offset}..{offset + job[1] - 1}): {ident}", flush=True)
         print("All jobs submitted. Monitor with squeue; logs:", out / "logs")
         print("Final completion marker:", out / "results" / "_SUCCESS")
 
@@ -704,8 +753,8 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
         if argv and argv[0] == "_worker":
-            require(len(argv) == 4 and argv[2] in STAGES, "Invalid internal worker invocation")
-            worker(argv[1], argv[2], positive(argv[3]))
+            require(len(argv) == 5 and argv[2] in STAGES and int(argv[4]) >= 0, "Invalid internal worker invocation")
+            worker(argv[1], argv[2], positive(argv[3]), int(argv[4]))
         else:
             launch(parser().parse_args(argv))
         return 0
