@@ -1,0 +1,340 @@
+#!/bin/bash -l
+#SBATCH -J alignment_gfa_pangenome
+#SBATCH --output=alignment_gfa_pangenome-%A_%a.output
+#SBATCH --error=alignment_gfa_pangenome-%A_%a.error
+#SBATCH -t 72:00:00
+#SBATCH --partition=low
+#SBATCH --account=publicgrp
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=plunarodriguez@ucdavis.edu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=300G
+#SBATCH --array=0-35
+
+set -euo pipefail
+
+echo "Running on host: $(hostname)"
+echo "Starting at: $(date)"
+echo "SLURM array task ID: ${SLURM_ARRAY_TASK_ID}"
+
+THREADS=64
+
+# =============================================================================
+# Input paths
+# =============================================================================
+
+READ_DIR=/home/davismw/projects/pistachio/bushy/trimmomatic/short_read/large_sample
+
+BASE=/group/gmonroegrp2/chaehee/Pablo/pangenome
+
+# =============================================================================
+# NEW: FASTA + VCF Giraffe indexes from atl_int_autoindex
+# =============================================================================
+
+INDEX_DIR="$BASE/01_atl_int_pangenome_per_chr/odgi_squeeze/vg_autoindex"
+INDEX_PREFIX="$INDEX_DIR/atl_int_chr_pangenome_refvcf"
+
+GBZ="${INDEX_PREFIX}.giraffe.gbz"
+GBZ_DIST="${INDEX_PREFIX}.dist"
+GBZ_MIN="${INDEX_PREFIX}.min"
+# =============================================================================
+# Output directories
+# Keep new alignments separate from old GFA-based alignments.
+# =============================================================================
+
+DIR1="$BASE/02_alignment_to_gfa_autoindex/refvcf"
+
+UNFILTERED_DIR="$DIR1/unfiltered"
+FILTERED_DIR="$DIR1/filtered"
+STATS_DIR="$UNFILTERED_DIR/stats"
+
+mkdir -p \
+    "$UNFILTERED_DIR" \
+    "$FILTERED_DIR" \
+    "$STATS_DIR"
+
+# =============================================================================
+# Utility functions
+# =============================================================================
+
+has_content() {
+    [[ -s "$1" ]]
+}
+
+all_have_content() {
+    local file
+
+    for file in "$@"; do
+        [[ -s "$file" ]] || return 1
+    done
+
+    return 0
+}
+
+# =============================================================================
+# Step 1: Verify new Giraffe indexes
+# =============================================================================
+
+echo "Checking FASTA + VCF Giraffe indexes..."
+
+if ! all_have_content \
+    "$GBZ" \
+    "$GBZ_DIST" \
+    "$GBZ_MIN" ; then
+
+    echo "ERROR: Missing one or more Giraffe index files." >&2
+
+    for file in \
+        "$GBZ" \
+        "$GBZ_DIST" \
+        "$GBZ_MIN" ; do
+
+        if [[ ! -s "$file" ]]; then
+            echo "Missing or empty: $file" >&2
+        fi
+
+    done
+
+    exit 1
+fi
+
+echo "Using FASTA + VCF indexes:"
+echo "GBZ:      $GBZ"
+echo "DIST:     $GBZ_DIST"
+echo "MIN:      $GBZ_MIN"
+
+# =============================================================================
+# Step 2: Identify sample for this array task
+# =============================================================================
+
+shopt -s nullglob
+
+FW_READS=("$READ_DIR"/*_1.trimmed.fastq.gz)
+
+shopt -u nullglob
+
+if (( ${#FW_READS[@]} != 36 )); then
+
+    echo "ERROR: expected 36 forward-read files, found ${#FW_READS[@]}" >&2
+
+    printf '%s\n' "${FW_READS[@]}" >&2
+
+    exit 1
+fi
+
+mapfile -t FW_READS < <(
+    printf '%s\n' "${FW_READS[@]}" | sort -V
+)
+
+FW_READ="${FW_READS[$SLURM_ARRAY_TASK_ID]}"
+
+RV_READ="${FW_READ/_1.trimmed.fastq.gz/_3.trimmed.fastq.gz}"
+
+SAMPLE=$(basename "$FW_READ" _1.trimmed.fastq.gz)
+
+if [[ ! -s "$RV_READ" ]]; then
+
+    echo "ERROR: reverse-read file does not exist:" >&2
+    echo "$RV_READ" >&2
+
+    exit 1
+fi
+
+echo "Processing sample: $SAMPLE"
+echo "Forward read: $FW_READ"
+echo "Reverse read: $RV_READ"
+
+# =============================================================================
+# Step 3: Activate vg environment
+# =============================================================================
+
+source /home/plunarod/miniconda3/etc/profile.d/conda.sh
+
+conda activate pangenome
+
+echo "VG version:"
+vg version
+
+# =============================================================================
+# Steps 4-6: Create, summarize, and filter the sample GAM
+# =============================================================================
+# If the filtered GAM already exists, skip alignment, stats, and filtering.
+# The unfiltered GAM may have already been deleted.
+
+GAM="$UNFILTERED_DIR/${SAMPLE}_aligned_atl_int_pangenome.gam"
+
+STATS="$STATS_DIR/${SAMPLE}_aligned_atl_int_pangenome_stats.txt"
+
+FILTERED_GAM="$FILTERED_DIR/${SAMPLE}_aln.filtered.gam"
+
+if has_content "$FILTERED_GAM"; then
+
+    echo "Filtered GAM already exists: $FILTERED_GAM"
+    echo "Skipping vg giraffe, vg stats, and vg filter."
+
+else
+
+    # -------------------------------------------------------------------------
+    # Step 4: Align reads with vg giraffe
+    #
+    # NEW:
+    #   -Z = FASTA + VCF generated GBZ
+    #   -d = matching distance index
+    # -------------------------------------------------------------------------
+
+    if has_content "$GAM"; then
+
+        echo "Skipping vg giraffe: $GAM already exists."
+
+    else
+
+        echo "Running vg giraffe using FASTA + VCF indexes..."
+
+        TMP_GAM="${GAM}.tmp.${SLURM_JOB_ID:-$$}"
+
+        vg giraffe \
+            -t "$THREADS" \
+            -Z "$GBZ" \
+            -d "$GBZ_DIST" \
+            -p \
+            -m "$GBZ_MIN" \
+            -f "$FW_READ" \
+            -f "$RV_READ" \
+            > "$TMP_GAM"
+
+        if [[ ! -s "$TMP_GAM" ]]; then
+
+            echo "ERROR: vg giraffe produced an empty GAM for $SAMPLE" >&2
+
+            rm -f "$TMP_GAM"
+            exit 1
+
+        fi
+
+        mv "$TMP_GAM" "$GAM"
+
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 5: Alignment statistics
+    # -------------------------------------------------------------------------
+
+    if has_content "$STATS"; then
+
+        echo "Skipping vg stats: $STATS already exists."
+
+    else
+
+        echo "Running vg stats..."
+
+        TMP_STATS="${STATS}.tmp.${SLURM_JOB_ID:-$$}"
+
+        vg stats \
+            -a "$GAM" \
+            > "$TMP_STATS"
+
+        if [[ ! -s "$TMP_STATS" ]]; then
+
+            echo "ERROR: vg stats produced an empty file for $SAMPLE" >&2
+
+            rm -f "$TMP_STATS"
+            exit 1
+
+        fi
+
+        mv "$TMP_STATS" "$STATS"
+
+    fi
+
+    # -------------------------------------------------------------------------
+    # Step 6: Filter the whole-sample GAM
+    # -------------------------------------------------------------------------
+
+    echo "Running vg filter..."
+
+    TMP_FILTERED_GAM="${FILTERED_GAM}.tmp.${SLURM_JOB_ID:-$$}"
+
+    vg filter "$GAM" \
+        -r 0.90 \
+        -fu \
+        -m 0 \
+        -t "$THREADS" \
+        -q 20 \
+        > "$TMP_FILTERED_GAM"
+
+    if [[ ! -s "$TMP_FILTERED_GAM" ]]; then
+
+        echo "ERROR: filtered GAM is empty for $SAMPLE" >&2
+
+        rm -f "$TMP_FILTERED_GAM"
+        exit 1
+
+    fi
+
+    mv "$TMP_FILTERED_GAM" "$FILTERED_GAM"
+
+    # Remove unfiltered GAM after successful filtering.
+
+    if [[ -s "$GAM" ]]; then
+
+        echo "Removing unfiltered GAM: $GAM"
+
+        rm -f "$GAM"
+
+    fi
+
+fi
+
+# =============================================================================
+# Step 7: Create pack from filtered GAM
+# =============================================================================
+
+PACK="$FILTERED_DIR/${SAMPLE}.pack"
+
+if [[ -s "$PACK" ]]; then
+
+    echo "Pack already exists: $PACK"
+
+else
+
+    echo "Creating pack for $SAMPLE..."
+
+    TMP_PACK="${PACK}.tmp.${SLURM_JOB_ID:-$$}"
+
+    vg pack \
+        -x "$GBZ" \
+        -g "$FILTERED_GAM" \
+        -t "$THREADS" \
+        -o "$TMP_PACK"
+
+    if [[ ! -s "$TMP_PACK" ]]; then
+
+        echo "ERROR: pack is empty for $SAMPLE" >&2
+
+        rm -f "$TMP_PACK"
+        exit 1
+
+    fi
+
+    mv "$TMP_PACK" "$PACK"
+
+    echo "Created pack: $PACK"
+
+fi
+
+# =============================================================================
+# Final report
+# =============================================================================
+
+echo "Successfully aligned and filtered sample: $SAMPLE"
+
+echo "Graph index:   $GBZ"
+echo "Output (GAM):  $FILTERED_GAM"
+echo "Output (Pack): $PACK"
+echo "Stats:         $STATS"
+
+echo "Finished sample $SAMPLE at: $(date)"
+
+conda deactivate
