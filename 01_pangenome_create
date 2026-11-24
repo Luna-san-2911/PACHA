@@ -1,0 +1,156 @@
+#!/bin/bash -l
+#SBATCH -J pggb_per_chr
+#SBATCH --array=1-15
+#SBATCH --output=pggb_per_chr-%A_%a.output
+#SBATCH --error=pggb_per_chr-%A_%a.error
+#SBATCH -t 48:00:00
+#SBATCH --partition=low
+#SBATCH --account=publicgrp
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=plunarodriguez@ucdavis.edu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=200G
+
+echo "Running on host: $(hostname)"
+echo "Starting at: $(date)"
+
+set -euo pipefail
+
+source /home/plunarod/miniconda3/etc/profile.d/conda.sh
+conda activate pangenome
+
+########################################
+# Paths
+########################################
+
+ATL_HAP1="/group/gmonroegrp2/chaehee/Pablo/pangenie/01_build_pangenome_vcf/input/Patl.hap1.Chr01_15.fa"
+ATL_HAP2="/group/gmonroegrp2/chaehee/Pablo/pangenie/01_build_pangenome_vcf/input/Patl.hap2.Chr01_15.fa"
+INT_HAP1="/group/gmonroegrp2/chaehee/Pablo/pangenie/01_build_pangenome_vcf/input/Pint.hap1.Chr01_15.fa"
+INT_HAP2="/group/gmonroegrp2/chaehee/Pablo/pangenie/01_build_pangenome_vcf/input/Pint.hap2.Chr01_15.fa"
+
+OUTPUT_ROOT="/group/gmonroegrp2/chaehee/Pablo/pangenome/01_atl_int_pangenome_per_chr"
+
+CHROMOSOMES=($(seq -f "%02g" 1 15))
+
+if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    echo "ERROR: This script is intended to run as a SLURM array job."
+    exit 1
+fi
+
+if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > ${#CHROMOSOMES[@]} )); then
+    echo "ERROR: SLURM_ARRAY_TASK_ID=${SLURM_ARRAY_TASK_ID} is out of range."
+    exit 1
+fi
+
+run_chromosome() {
+    local chr_num="$1"
+    local chr="Chr${chr_num}"
+    local chr_tag="chr${chr_num}"
+    local out="${OUTPUT_ROOT}/${chr_tag}"
+
+    local input_fasta="${out}/atl_int_${chr_tag}.fa"
+    local input_fasta_gz="${input_fasta}.gz"
+    local input_fasta_fai="${input_fasta_gz}.fai"
+
+    mkdir -p "${out}"
+
+########################################
+# Sanity checks
+########################################
+
+    for F in "${ATL_HAP1}" "${ATL_HAP2}" "${INT_HAP1}" "${INT_HAP2}"; do
+        [[ -s "${F}" ]] || { echo "ERROR: Missing FASTA: ${F}"; exit 1; }
+    done
+
+########################################
+# Build chromosome FASTA
+########################################
+
+    echo "========================================"
+    echo "Processing ${chr}"
+    echo "========================================"
+
+    if [[ -s "${input_fasta_gz}" && -s "${input_fasta_fai}" ]]; then
+        echo "Input FASTA already exists; skipping FASTA extraction."
+    else
+        echo "Extracting ${chr} from all 4 haplotypes..."
+        (
+        awk -v chr=">${chr}" '/^>/ {keep=($1==chr)} keep' "${ATL_HAP1}" \
+            | sed "s/^>${chr}$/>Patl#1#${chr}/"
+        awk -v chr=">${chr}" '/^>/ {keep=($1==chr)} keep' "${ATL_HAP2}" \
+            | sed "s/^>${chr}$/>Patl#2#${chr}/"
+        awk -v chr=">${chr}" '/^>/ {keep=($1==chr)} keep' "${INT_HAP1}" \
+            | sed "s/^>${chr}$/>Pint#1#${chr}/"
+        awk -v chr=">${chr}" '/^>/ {keep=($1==chr)} keep' "${INT_HAP2}" \
+            | sed "s/^>${chr}$/>Pint#2#${chr}/"
+        ) > "${input_fasta}"
+        
+        [[ -s "${input_fasta}" ]] || {
+            echo "ERROR: Empty FASTA after extraction."
+            exit 1
+        }
+
+        echo "Compressing FASTA..."
+        bgzip -f "${input_fasta}"
+        samtools faidx "${input_fasta_gz}"
+        echo "FASTA extraction complete."
+    fi
+
+########################################
+# Run PGGB
+########################################
+
+    echo "========================================"
+    echo "Running PGGB for ${chr}"
+    echo "========================================"
+
+    local pggb_graph
+    pggb_graph=$(find "${out}" -maxdepth 1 \
+        -name "*.smooth.final.og" 2>/dev/null | head -n 1)
+
+    if [[ -n "${pggb_graph}" && -s "${pggb_graph}" ]]; then
+        echo "PGGB output already exists: ${pggb_graph}"
+    else
+        echo "Running PGGB..."
+        #IS WORTH MENTIONING THAT THE PARAMETERS ARE PRETTY SIMILAR THAN THE ONES OF HUMAN GENOMES
+        #-s as reccomened by PGGB paper and Saccharum super-pangenome
+        #-p From Mash analysis per chromosome
+        #-P This is adequate for sequences within 5% divergence, according to optional parameters in PGGB github
+        #-k as reccomened by PGGB paper and Saccharum super-pangenome
+        #-m to do the multiqc report
+        #-G based on the 99th quartile of EDTA which was a TE of 9kb
+        pggb -i "${input_fasta_gz}" \
+            -n 4 \
+            -s 20000 \
+            -p 90 \
+            -P asm20 \
+            -k 47 \
+            -m \
+            -G 10000,15000 \
+            -O 0.03 \
+            -o "${out}" \
+            -t "${SLURM_CPUS_PER_TASK}" 
+
+        pggb_graph=$(find "${out}" -maxdepth 1 \
+            -name "*.smooth.final.og" 2>/dev/null | head -n 1)
+    fi
+
+    [[ -n "${pggb_graph}" && -s "${pggb_graph}" ]] || {
+        echo "ERROR: Could not locate PGGB graph (.og file)."
+        exit 1
+    }
+
+    echo "PGGB complete: ${pggb_graph}"
+    echo "Graph statistics:"
+    odgi stats "${pggb_graph}" -S | head -15 || true
+    echo "========================================"
+    echo "Done processing ${chr}"
+    echo "========================================"
+}
+
+run_chromosome "${CHROMOSOMES[$((SLURM_ARRAY_TASK_ID - 1))]}"
+
+echo "Finished at: $(date)"
+conda deactivate
