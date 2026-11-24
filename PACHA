@@ -2,6 +2,7 @@
 """PACHA: one-command diploid graph-based haplotype inference, locally or on SLURM."""
 import argparse
 import contextlib
+import csv
 import fcntl
 import gzip
 import hashlib
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 TOOLS = ("pggb", "odgi", "vg", "samtools", "bcftools", "bgzip", "whatshap")
 FASTA = re.compile(r"\.(?:fa|fasta|fna)(?:\.gz)?$", re.I)
 FASTQ = re.compile(r"^(.*?)(?:_R([12])(?:_001)?|_([123]))(?:\.trimmed)?\.(?:fastq|fq)(?:\.gz)?$", re.I)
@@ -124,6 +125,38 @@ def discover_reads(directory):
     return result
 
 
+def read_sample_sheet(path):
+    """Explicit sample IDs and paired FASTQs, independent of filenames."""
+    sheet = Path(path).expanduser().resolve(strict=True)
+    require(sheet.is_file(), f"Sample sheet is not a file: {sheet}")
+    result, names, file_keys = [], set(), set()
+    with open(sheet, newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        require(reader.fieldnames == ["sample", "r1", "r2"],
+                "Sample sheet header must be exactly: sample<TAB>r1<TAB>r2")
+        for row in reader:
+            require(set(row) == {"sample", "r1", "r2"} and all(row[k] and row[k].strip() for k in row),
+                    f"Missing or extra sample-sheet field on line {reader.line_num}")
+            name = row["sample"]
+            require(SAFE.fullmatch(name), f"Invalid sample ID: {name}; use letters, digits, dots, underscores or hyphens")
+            require(name not in names, f"Duplicate sample ID: {name}")
+            names.add(name)
+            sample = {"name": name}
+            for mate in ("r1", "r2"):
+                source = Path(row[mate]).expanduser()
+                if not source.is_absolute():
+                    source = sheet.parent / source
+                record = fingerprint(source)
+                st = Path(record["path"]).stat()
+                key = (st.st_dev, st.st_ino)
+                require(key not in file_keys, f"FASTQ assigned more than once: {source}")
+                file_keys.add(key)
+                sample[mate] = record
+            result.append(sample)
+    require(result, f"No samples in {sheet}")
+    return sorted(result, key=lambda sample: sample["name"])
+
+
 def discover_genomes(directory, reference, validate_all=False):
     # -ref is an explicit FASTA, whether inside or outside -g. Compare
     # device/inode as well as resolved paths to catch symlinks and hardlinks.
@@ -170,11 +203,15 @@ def parser():
     p = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     p.add_argument("--version", action="version", version=f"PACHA {VERSION}")
     p.add_argument("-m", "--mode", choices=("graph", "vcf"), required=True)
-    p.add_argument("-r", "--reads", type=Path, required=True)
+    read_inputs = p.add_mutually_exclusive_group(required=True)
+    read_inputs.add_argument("-r", "--reads", type=Path, help="Directory of automatically paired FASTQs")
+    read_inputs.add_argument("--sample-sheet", type=Path, help="TSV with sample, r1, r2 columns; arbitrary FASTQ filenames")
     p.add_argument("-g", "--genomes", type=Path, required=True)
     p.add_argument("-t", "--threads", type=positive, help="CPUs per graph/merge task (default: 16, capped to available CPUs locally)")
-    p.add_argument("-a", "--array", type=positive, help="Maximum concurrent sample tasks (default: 4 on SLURM, 1 locally)")
-    p.add_argument("-at", "--array-threads", type=positive, help="CPUs per sample task (default: 8, capped to available CPUs locally)")
+    p.add_argument("-a", "--concurrent-samples", "--array", dest="array", type=positive,
+                   help="Maximum simultaneously running individuals per alignment, calling, phasing or consensus stage (default: 4 on SLURM, 1 locally)")
+    p.add_argument("-at", "--sample-threads", "--array-threads", dest="array_threads", type=positive,
+                   help="CPUs per individual task (default: 8, capped to available CPUs locally)")
     p.add_argument("-o", "--output", type=Path, required=True)
     p.add_argument("-ref", "--reference", type=Path, required=True,
                    help="Reference FASTA path; included in the graph once and used as the VCF/consensus backbone")
@@ -231,13 +268,22 @@ def configuration(args):
             "Invalid PGGB POA length or padding")
     require(all(x >= 0 for x in (args.min_mapq, args.min_qual, args.min_gq, args.min_depth)),
             "Filtering thresholds cannot be negative")
-    r, g = args.reads.expanduser().resolve(strict=True), args.genomes.expanduser().resolve(strict=True)
-    require(r.is_dir() and g.is_dir(), "-r and -g must be directories")
+    g = args.genomes.expanduser().resolve(strict=True)
+    require(g.is_dir(), "-g must be a directory")
     out = args.output.expanduser().resolve()
-    require(out != r and out != g and not out.is_relative_to(r) and not out.is_relative_to(g),
-            "Output must be outside the input directories")
+    require(not out.is_relative_to(g), "Output must be outside the genome directory")
+    if args.reads is not None:
+        r = args.reads.expanduser().resolve(strict=True)
+        require(r.is_dir(), "-r must be a directory")
+        require(not out.is_relative_to(r), "Output must be outside the reads directory")
+        samples = discover_reads(r)
+    else:
+        samples = read_sample_sheet(args.sample_sheet)
     genomes, ref, chromosomes = discover_genomes(g, args.reference, args.validate_genomes)
-    samples = discover_reads(r)
+    input_files = [Path(s[m]["path"]) for s in samples for m in ("r1", "r2")]
+    input_files.extend(Path(rec["path"]) for rec in genomes)
+    require(not any(p.is_relative_to(out) for p in input_files),
+            "Output directory must not contain any input FASTA or FASTQ files")
     options = {k: getattr(args, k) for k in ("segment_length", "mapping_identity", "poa_preset",
         "min_match", "poa_length", "poa_padding", "min_aln_identity", "min_mapq",
         "min_qual", "min_gq", "min_depth")}
@@ -336,6 +382,12 @@ def configure_execution(args):
         else:
             executor = "local"
     if executor == "local":
+        if in_allocation:
+            require(not os.environ.get("SLURM_ARRAY_TASK_ID"),
+                    "Run the PACHA driver as one sbatch job, not as a SLURM array; PACHA manages sample concurrency")
+            require(int(os.environ.get("SLURM_NTASKS", "1")) == 1 and
+                    int(os.environ.get("SLURM_JOB_NUM_NODES", "1")) == 1,
+                    "Local execution inside SLURM requires one node and one task")
         require(not any(getattr(args, k) for k in SLURM_KEYS) and
                 not any((args.time, args.graph_time, args.sample_time, args.stage_time,
                          args.stage_partition, args.stage_account, args.stage_qos, args.slurm_option)),
@@ -421,13 +473,18 @@ def print_plan(args, cfg, executor, budget):
     print(f"PACHA {VERSION} | graph | {len(cfg['genomes'])} haplotypes | {len(cfg['chromosomes'])} chromosomes | {len(cfg['samples'])} samples")
     print("Reference:", cfg["genomes"][cfg["reference_index"]]["path"])
     print("Output:", cfg["output"])
+    print(f"Maximum concurrent individuals per sample stage: {args.array}; CPUs per individual: {args.array_threads}")
     if executor == "local":
         print(f"Execution: local on one node | CPU budget: {budget}" +
               (" (existing SLURM allocation)" if os.environ.get("SLURM_JOB_ID") else ""))
+        print("No child sbatch jobs or SLURM arrays will be submitted; sample tasks are local processes.")
         print("Memory:", f"admission budget {args.local_memory} (estimates, not hard limits)" if args.local_memory
               else "no memory admission budget; choose safe concurrency and sufficient physical RAM")
     else:
         print("Execution: submit dependent SLURM jobs (returns after submission)")
+        print("Sample arrays use SLURM % throttling; the limit is on running tasks, not all queued tasks.")
+        if os.environ.get("SLURM_JOB_ID"):
+            print("Explicit SLURM submission from an allocation: child jobs have independent resources.")
     for job in jobs(args, cfg):
         stage, n, simultaneous, cpus, mem, duration, array = job
         if executor == "local":
@@ -874,6 +931,7 @@ def terminate_local(processes):
 
 def local_stage(cfg, job, concurrency, snapshot, manifest):
     stage, count, _, cpus, _, _, _ = job
+    require(concurrency >= 1, "Local task concurrency must be at least one")
     running = {}
     next_index = 0
     failures = []

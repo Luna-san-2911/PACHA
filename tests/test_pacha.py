@@ -340,5 +340,82 @@ class PipelineTests(unittest.TestCase):
         task.assert_called_once_with(cfg, "prepare", 1, 1)
 
 
+    def sheet_args(self, sheet):
+        argv = self.argv.copy()
+        idx = argv.index("-r")
+        argv[idx:idx+2] = ["--sample-sheet", str(sheet)]
+        return argv
+
+    def test_sample_sheet_arbitrary_filenames(self):
+        (self.reads / "a forward.fastq").write_text("@r\nACGT\n+\nIIII\n")
+        (self.reads / "arbitrary-reverse.fq").write_text("@r\nACGT\n+\nIIII\n")
+        sheet = self.root / "samples.tsv"
+        sheet.write_text("sample\tr1\tr2\nPlant-X.7\treads/a forward.fastq\treads/arbitrary-reverse.fq\n")
+        cfg = p.configuration(p.parser().parse_args(self.sheet_args(sheet)))
+        self.assertEqual(len(cfg["samples"]), 1)
+        sample = cfg["samples"][0]
+        self.assertEqual(sample["name"], "Plant-X.7")
+        self.assertEqual(sample["r1"]["path"], str(self.reads / "a forward.fastq"))
+        self.assertEqual(p.stage_dir(cfg, "align", 0).name, "Plant-X.7")
+
+    def test_sample_sheet_rejects_duplicate_reads(self):
+        sheet = self.root / "samples.tsv"
+        sheet.write_text("sample\tr1\tr2\nA\treads/A_R1.fastq\treads/A_R2.fastq\n"
+                         "B\treads/A_R1.fastq\treads/B_R2.fastq\n")
+        with self.assertRaisesRegex(ValueError, "assigned more than once"):
+            p.configuration(p.parser().parse_args(self.sheet_args(sheet)))
+
+    def test_sample_sheet_rejects_unsafe_id_and_bad_header(self):
+        sheet = self.root / "samples.tsv"
+        sheet.write_text("name\tforward\treverse\nA\treads/A_R1.fastq\treads/A_R2.fastq\n")
+        with self.assertRaisesRegex(ValueError, "header"):
+            p.read_sample_sheet(sheet)
+        sheet.write_text("sample\tr1\tr2\n../A\treads/A_R1.fastq\treads/A_R2.fastq\n")
+        with self.assertRaisesRegex(ValueError, "Invalid sample ID"):
+            p.read_sample_sheet(sheet)
+
+    def test_concurrent_samples_aliases_and_native_throttle(self):
+        args = p.parser().parse_args(self.argv + ["--concurrent-samples", "1",
+            "--sample-threads", "4", "--array-batch-size", "2"])
+        self.assertEqual((args.array, args.array_threads), (1, 4))
+        cfg = p.configuration(args)
+        for stage in ("align", "call", "phase", "consensus"):
+            batches = [(j, offset) for j, offset in p.job_batches(args, cfg) if j[0] == stage]
+            self.assertEqual([(j[1], offset) for j, offset in batches], [(2, 0), (1, 2)])
+            for j, offset in batches:
+                cmd = p.submit_command(args, cfg, j, ROOT / "PACHA", self.root / "manifest", "123", offset)
+                self.assertIn(f"--array=0-{j[1]-1}%1", cmd)
+                self.assertIn("--cpus-per-task=4", cmd)
+                self.assertIn("--dependency=afterok:123", cmd)
+
+    def test_existing_allocation_auto_never_submits_children(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "auto",
+            "--concurrent-samples", "3", "--sample-threads", "8"])
+        env = {"SLURM_JOB_ID": "123", "SLURM_CPUS_PER_TASK": "32",
+               "SLURM_NTASKS": "1", "SLURM_JOB_NUM_NODES": "1"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(p, "available_cpus", return_value=32), \
+             patch.object(p.shutil, "which", return_value="/bin/tool"), \
+             patch.object(p, "run_slurm") as slurm, \
+             patch.object(p, "run_local") as local:
+            p.launch(args)
+        slurm.assert_not_called()
+        local.assert_called_once()
+        self.assertFalse((self.root / "out" / ".pacha" / "jobs.json").exists())
+
+    def test_outer_slurm_array_rejected(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "local"])
+        with patch.dict(os.environ, {"SLURM_JOB_ID": "123", "SLURM_ARRAY_TASK_ID": "0"}, clear=True):
+            with self.assertRaisesRegex(ValueError, "one sbatch job"):
+                p.configure_execution(args)
+
+    def test_repository_no_archived_cluster_scripts(self):
+        self.assertFalse((ROOT / "legacy").exists())
+        for relative in ("PACHA", "examples/run_pacha.sbatch", "README.md"):
+            content = (ROOT / relative).read_text()
+            for prefix in ("/home/", "/group/", "/blue/", "/lustre/", "/scratch/"):
+                self.assertNotIn(prefix, content, relative)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,7 +2,7 @@
 
 **Pangenome Aware Chromosome-level Haplotype Assembler**
 
-PACHA infers two reference-guided haplotype consensus sequences per diploid individual from paired-end short reads and chromosome-level haplotype assemblies. Version 0.3.0 supports local execution, automatic SLURM submission and execution inside a single existing SLURM allocation, with explicit reference selection and scalable source panels. Graph mode is implemented; VCF mode is reserved and explicitly rejected.
+PACHA infers two reference-guided haplotype consensus sequences per diploid individual from paired-end short reads and chromosome-level haplotype assemblies. Version 0.3.1 supports local execution, automatic SLURM submission and execution inside a single existing SLURM allocation, with explicit reference selection and scalable source panels. Graph mode is implemented; VCF mode is reserved and explicitly rejected.
 
 ## Installation (Linux)
 
@@ -29,6 +29,8 @@ The scientific workflow is identical in every execution mode. The default --exec
 
 Specify --executor local or --executor slurm to override detection. The executor is independent of -m graph (the scientific method).
 
+**Sample concurrency:** use --concurrent-samples N (short form -a) to cap the number of individuals running simultaneously in each alignment, variant calling, phasing and consensus stage. Use --sample-threads T (short form -at) for CPUs per individual. Stages do not overlap. These are the same settings in every executor; users do not need to calculate or specify array indices.
+
 ### A. Local workstation or server without SLURM
 
 ```bash
@@ -36,11 +38,11 @@ PACHA --executor local -m graph \
   -r /path/to/reads \
   -g /path/to/genomes \
   -ref /path/to/reference.fa \
-  -t 16 -a 2 -at 8 \
+  -t 16 --concurrent-samples 2 --sample-threads 8 \
   -o /path/to/output
 ```
 
-This runs in the foreground until completion or failure. No scheduler is required. Use a persistent terminal session (such as tmux) if disconnecting from a remote server. Local execution uses one node and caps concurrent tasks according to the CPU affinity/available CPU budget. If -t or -at exceeds the available budget, PACHA stops before starting work. For instance, on a 16-CPU machine, -a 10 -at 8 permits at most two concurrent sample tasks.
+This runs in the foreground until completion or failure. No scheduler is required. Use a persistent terminal session (such as tmux) if disconnecting from a remote server. Local execution uses one node and caps concurrent tasks according to the CPU affinity/available CPU budget. If -t or -at exceeds the available budget, PACHA stops before starting work. For instance, on a 16-CPU machine, --concurrent-samples 10 --sample-threads 8 permits at most two concurrent sample tasks. PACHA starts the next waiting individual as a slot becomes free.
 
 For explicit memory-aware scheduling, add --local-memory 128G together with realistic estimates for every stage using --mem and --stage-mem. For example, if justified by a pilot dataset, use --mem 32G --stage-mem graph=96G --stage-mem index=96G. These values are admission-control estimates, not operating-system memory limits. Without --local-memory, PACHA does not enforce memory-based concurrency. Do not lower estimates simply to bypass resource checks. Large genomes may need far more RAM than a workstation has.
 
@@ -53,7 +55,7 @@ PACHA --executor slurm -m graph \
   -r /path/to/reads \
   -g /path/to/genomes \
   -ref /path/to/reference.fa \
-  -t 32 -a 10 -at 16 \
+  -t 32 --concurrent-samples 10 --sample-threads 16 \
   -o /path/to/output \
   --partition normal --account mylab --qos normal \
   --time 48:00:00 --mem 128G \
@@ -64,9 +66,26 @@ PACHA --executor slurm -m graph \
 
 Replace the example partition, account and QoS with actual site values; omit those that are unnecessary. PACHA submits dependent jobs and arrays, then returns. Jobs continue independently of the terminal. Each stage starts only after its preceding stage succeeds. CPU and memory requests are per task, not per array. Adjust the time limits to comply with your partition policy.
 
+For 500 individuals with --concurrent-samples 10, PACHA uses a native SLURM array such as --array=0-499%10 for alignment and then another for variant calling. At most 10 sample tasks run at once across these sequential stages, but other array elements may remain pending. The limit applies to this PACHA run only, not to other jobs or total queued-job quotas. If your cluster limits the size of submitted arrays, set --array-batch-size (e.g. 100); batches are dependency-linked so that they cannot overlap. All stage jobs are submitted up front in this mode.
+
 ### C. Run PACHA inside your own sbatch script
 
-Use this option if you want the entire pipeline contained within one SLURM allocation, using your own scheduler directives. Save as run_pacha.sbatch and adjust the paths and resource requests to suit your cluster and data.
+**Option C submits exactly one SLURM job: your outer sbatch job. PACHA does NOT submit any child sbatch scripts or native SLURM arrays.** Inside that job, PACHA starts ordinary local worker processes as slots become available. The existing allocation supplies all CPU, memory and walltime resources. The sample-concurrency flag caps those processes just as it caps running array elements in option B.
+
+A ready-to-use generic wrapper is included in examples/run_pacha.sbatch. Activate the environment and add the repository to PATH as shown in Installation, then from the repository directory run:
+
+```bash
+sbatch --partition=normal --account=mylab \
+  --cpus-per-task=32 --mem=256G --time=48:00:00 \
+  examples/run_pacha.sbatch \
+  -m graph -r /path/to/reads -g /path/to/genomes \
+  -ref /path/to/reference.fa -o /path/to/output \
+  -t 32 --concurrent-samples 4 --sample-threads 8
+```
+
+The wrapper forwards every user argument to PACHA and forces --executor local. No paths, sample names, accounts or partitions are hard-coded in it. Its default resource directives can be overridden on the sbatch command line. If needed, add your cluster-specific Conda initialization to the wrapper.
+
+Alternatively, write your own sbatch script:
 
 ```bash
 #!/bin/bash
@@ -75,48 +94,39 @@ Use this option if you want the entire pipeline contained within one SLURM alloc
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --mem=256G
-#SBATCH --time=4-00:00:00
-#SBATCH --partition=normal
-#SBATCH --account=mylab
+#SBATCH --time=48:00:00
 #SBATCH --output=pacha-%j.log
 
 set -euo pipefail
-
-source /path/to/miniconda3/etc/profile.d/conda.sh
-conda activate pacha
-
-/path/to/PACHA/PACHA --executor local -m graph \
-  -r /path/to/reads \
-  -g /path/to/genomes \
-  -ref /path/to/reference.fa \
-  -t 32 -a 4 -at 8 \
-  -o /path/to/output \
-  --local-cpus 32 --local-memory 256G \
-  --mem 128G --stage-mem graph=200G \
-  --stage-mem index=256G --stage-mem align=128G
+# Activate the pacha environment here if not already activated.
+PACHA --executor local -m graph \
+  -r /path/to/reads -g /path/to/genomes \
+  -ref /path/to/reference.fa -o /path/to/output \
+  -t 32 --concurrent-samples 4 --sample-threads 8
 ```
 
-```bash
-sbatch run_pacha.sbatch
-```
+Submit with sbatch run_pacha.sbatch. Add your site's partition, account, QoS and other directives as needed.
 
-This does not submit child jobs. CPU budget is limited by SLURM_CPUS_PER_TASK and CPU affinity; the allocation must cover the full workflow runtime and peak memory. The example memory estimates must be validated for your dataset. SLURM enforces the allocation's actual memory and time limits; PACHA's local-memory option only limits simultaneous tasks according to estimates. Request one node and one task. Do not use srun with multiple tasks or launch PACHA as a SLURM array itself. If a site's maximum walltime is too short for the full pipeline, prefer option B; alternatively resubmit the same script to reuse completed tasks. A stage task that exceeds the walltime must be restarted.
+With 32 allocated CPUs, four sample tasks using eight CPUs each can run concurrently. PACHA will reduce concurrency if CPUs are insufficient. To also cap concurrency based on memory, supply --local-memory 256G and realistic per-task memory estimates with --mem/--stage-mem (e.g. --stage-mem align=64G permits at most four such alignment tasks within that budget, subject to CPU limits). The estimates are not hard limits; SLURM enforces the actual job allocation. These figures are examples, not universal resource recommendations.
 
-If you instead explicitly request --executor slurm inside a batch script, PACHA submits independent child jobs and exits after submission. The parent allocation does not supply resources to those jobs and its #SBATCH settings are not inherited by PACHA; pass the desired child resources on the command line. Avoid this approach unless the cluster permits nested submissions.
+Use exactly one node and one task, and do not put the outer script in a SLURM array. The complete workflow must fit the allocation's walltime and memory; if it times out, resubmit the same command to reuse completed stages. An individual stage task that times out must restart.
+
+For multiple nodes or separately scheduled sample arrays, use option B. Explicit --executor slurm inside your own batch script is an opt-in to submitting independent child jobs, not to using the parent allocation; supply child resource flags separately and ensure nested submission is permitted. It is not needed for option C.
 
 ## Command-line options
 
 | Flag | Meaning |
 |---|---|
 | -m | graph (implemented); vcf (future) |
-| -r | Directory containing paired-end FASTQ files |
+| -r | Directory containing paired-end FASTQ files (automatic pairing) |
+| --sample-sheet | TSV mapping arbitrary FASTQ filenames to sample IDs; alternative to -r |
 | -g | Directory containing one chromosome-level haplotype per FASTA |
 | -ref, --reference | **Required** reference FASTA path, inside or outside -g |
 | -o | Output directory (new or existing matching PACHA run) |
 | --executor | auto (default), local, slurm |
 | -t | CPUs per graph/index task (SLURM default 16; local default up to 16) |
-| -a | Maximum concurrent sample tasks (SLURM default 4; local default 1) |
-| -at | CPUs per sample task (SLURM default 8; local default up to 8) |
+| --concurrent-samples, -a | Maximum running individuals per sample stage (SLURM default 4; local default 1) |
+| --sample-threads, -at | CPUs per individual task (SLURM default 8; local default up to 8) |
 | --prepare-parallel | Maximum concurrent source FASTA preparation tasks (default 8) |
 | --graph-parallel | Maximum concurrent chromosome PGGB tasks (default 1) |
 | --local-cpus | Total local CPU budget, at most available/allocated CPUs |
@@ -124,6 +134,8 @@ If you instead explicitly request --executor slurm inside a batch script, PACHA 
 | --array-batch-size | Maximum tasks per SLURM array (default 1000) |
 | --dry-run | Print execution plan without creating output or starting jobs |
 | --validate-genomes | Exhaustively validate source FASTA chromosome headers before starting |
+
+The old --array and --array-threads spellings remain supported as compatibility aliases. The recommended names describe sample concurrency without implying that local execution requires a scheduler.
 
 The reference is included in the pangenome exactly once by file identity: if it is outside -g and not already represented by the same file, it is added to the source panel. Symlink and hardlink aliases are recognized; distinct files containing identical sequences are not collapsed. No alphabetical fallback is used.
 
@@ -148,7 +160,7 @@ Always start with --dry-run to review task counts, effective concurrency, resour
 
 ## Large pangenome panels
 
-There is no fixed number of input haplotype assemblies or target individuals. PGGB receives the actual number of source haplotypes (including the chosen reference); each chromosome is built from all source FASTAs, with one source path per FASTA. The preparation array normalizes and indexes each FASTA independently. FASTA extraction for chromosome graphs streams one source at a time. Large arrays are split into sequential, dependency-linked batches, preserving global task indices and concurrency limits. Adjust --array-batch-size to your cluster's MaxArraySize, and --prepare-parallel, --graph-parallel, -a and memory/time options to the resources available.
+There is no fixed number of input haplotype assemblies or target individuals. PGGB receives the actual number of source haplotypes (including the chosen reference); each chromosome is built from all source FASTAs, with one source path per FASTA. The preparation array normalizes and indexes each FASTA independently. FASTA extraction for chromosome graphs streams one source at a time. Large arrays are split into sequential, dependency-linked batches, preserving global task indices and concurrency limits. Adjust --array-batch-size to your cluster's MaxArraySize, and --prepare-parallel, --graph-parallel, --concurrent-samples and memory/time options to the resources available.
 
 For example, 200 source FASTAs in -g plus a separate reference not present in that directory give 201 source haplotypes. With 500 paired-end target individuals, a successful run publishes exactly 1,000 FASTA files: hap1 and hap2 for each individual. The number of output haplotypes is determined by the diploid target samples, not the size of the source panel. PGGB graph construction and VG whole-genome indexing still have panel-dependent memory, CPU, disk and walltime costs. There is no claim that arbitrarily large graphs fit the default resources.
 
@@ -156,8 +168,31 @@ For example, 200 source FASTAs in -g plus a separate reference not present in th
 
 * One FASTA file per source haplotype, including a single haploid reference FASTA specified by -ref. For phased diploid source genomes, provide each haplotype as a separate FASTA. All must have the same set of chromosome identifiers as the reference. Chromosome count and sample count are inferred, not hard-coded. Use consistent, unique chromosome names (e.g. Chr01); no whitespace or # in the identifier. Descriptions following the first header token are ignored. FASTA extensions: .fa, .fasta, .fna, optionally .gz.
 * Paired reads directly in -r, one pair per sample. Supported patterns: SAMPLE_R1.fastq.gz / SAMPLE_R2.fastq.gz, SAMPLE_R1_001.fastq.gz / SAMPLE_R2_001.fastq.gz, SAMPLE_1.fq.gz / SAMPLE_2.fq.gz, and legacy SAMPLE_1.trimmed.fastq.gz / SAMPLE_3.trimmed.fastq.gz. Uncompressed files and .fq are supported. Merge sequencing lanes beforehand. Mixed or ambiguous pairs fail validation.
+* If FASTQ filenames use nonstandard naming or files are in different directories, use --sample-sheet instead of -r. See the example below.
 * Inputs must be visible at identical absolute paths on compute nodes; use a shared filesystem. Do not edit inputs during a run. PACHA checks file sizes and modification times, not full input content hashes.
 * Assemblies must use homologous chromosome labels and comparable orientation. PACHA does not discover orthology or rename noncorresponding chromosomes. Diploid target samples only.
+
+### Arbitrary sample names and FASTQ filenames
+
+For standard filenames, PACHA discovers each individual's ID from the paired FASTQ names. For nonstandard filenames, create a tab-separated samples.tsv with exactly three columns:
+
+```text
+sample	r1	r2
+individual_A	reads/forward_file.fq.gz	reads/reverse_file.fq.gz
+individual_B	reads/another_forward.fastq.gz	reads/another_reverse.fastq.gz
+```
+
+Relative read paths are resolved relative to the sample sheet. Absolute paths also work. Use unique sample IDs consisting of letters, digits, dots, underscores or hyphens, beginning with a letter or digit. Each row must identify one paired-end individual; merge sequencing lanes beforehand. Duplicate sample IDs and reused read files are rejected.
+
+```bash
+PACHA --executor local -m graph \
+  --sample-sheet samples.tsv \
+  -g /path/to/genomes -ref /path/to/reference.fa \
+  -t 16 --concurrent-samples 2 --sample-threads 8 \
+  -o /path/to/output
+```
+
+All sample paths are determined from the run manifest. For example, individual_A receives results/individual_A_hap1.fa.gz and results/individual_A_hap2.fa.gz. PACHA has no dataset-specific paths or sample IDs.
 
 ## Workflow
 
@@ -208,5 +243,5 @@ These are **reference-guided chromosome-length consensus sequences**, not valida
 python -m unittest discover -s tests -v
 ```
 
-Unit tests cover required reference selection, external references, reference aliases, a synthetic 1,003-source panel, array batching, selected reference preparation, two outputs per individual, input discovery, command construction, dry run, receipts, consensus genotype selection and mocked SLURM submission. Additional tests cover executor detection, allocated CPU limits, memory-aware concurrency, resource overrides, actual local subprocess orchestration using fake workers, restart, failure propagation and stage ordering. Real scientific end-to-end validation requires the installed bioinformatics tools; SLURM integration also requires a real cluster. The original six research scripts are retained under legacy/ for provenance; they are not invoked by PACHA.
+Unit tests cover required reference selection, external references, reference aliases, a synthetic 1,003-source panel, array batching, selected reference preparation, two outputs per individual, input discovery, command construction, dry run, receipts, consensus genotype selection and mocked SLURM submission. Additional tests cover executor detection, allocated CPU limits, memory-aware concurrency, resource overrides, actual local subprocess orchestration using fake workers, restart, failure propagation and stage ordering. Real scientific end-to-end validation requires the installed bioinformatics tools; SLURM integration also requires a real cluster. The original dataset-specific research scripts have been removed from the current tree. They remain recoverable from [the historical revision](https://github.com/Luna-san-2911/PACHA/tree/be57159017ab6460ff99e86b0d6640014d70ee0c) for provenance. PACHA is the only active pipeline implementation. This release also tests arbitrary FASTQ filenames, sample-sheet validation, native SLURM throttling, no child submissions in an existing allocation and absence of legacy scripts.
 
