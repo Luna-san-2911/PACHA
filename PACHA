@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PACHA: one-command, diploid, graph-based haplotype inference on SLURM."""
+"""PACHA: one-command diploid graph-based haplotype inference, locally or on SLURM."""
 import argparse
 import contextlib
 import fcntl
@@ -11,11 +11,13 @@ from pathlib import Path
 import re
 import shlex
 import shutil
+import signal
+import time
 import subprocess
 import sys
 import tempfile
 
-VERSION = "0.2.1"
+VERSION = "0.3.0"
 TOOLS = ("pggb", "odgi", "vg", "samtools", "bcftools", "bgzip", "whatshap")
 FASTA = re.compile(r"\.(?:fa|fasta|fna)(?:\.gz)?$", re.I)
 FASTQ = re.compile(r"^(.*?)(?:_R([12])(?:_001)?|_([123]))(?:\.trimmed)?\.(?:fastq|fq)(?:\.gz)?$", re.I)
@@ -170,30 +172,41 @@ def parser():
     p.add_argument("-m", "--mode", choices=("graph", "vcf"), required=True)
     p.add_argument("-r", "--reads", type=Path, required=True)
     p.add_argument("-g", "--genomes", type=Path, required=True)
-    p.add_argument("-t", "--threads", type=positive, default=16, help="CPUs per graph/merge job")
-    p.add_argument("-a", "--array", type=positive, default=4, help="Maximum concurrent sample tasks")
-    p.add_argument("-at", "--array-threads", type=positive, default=8, help="CPUs per sample task")
+    p.add_argument("-t", "--threads", type=positive, help="CPUs per graph/merge task (default: 16, capped to available CPUs locally)")
+    p.add_argument("-a", "--array", type=positive, help="Maximum concurrent sample tasks (default: 4 on SLURM, 1 locally)")
+    p.add_argument("-at", "--array-threads", type=positive, help="CPUs per sample task (default: 8, capped to available CPUs locally)")
     p.add_argument("-o", "--output", type=Path, required=True)
     p.add_argument("-ref", "--reference", type=Path, required=True,
                    help="Reference FASTA path; included in the graph once and used as the VCF/consensus backbone")
     p.add_argument("--prepare-parallel", type=positive, default=8, help="Concurrent source FASTA preparation tasks")
-    p.add_argument("--prepare-mem", default="16G", help="Memory per FASTA preparation task")
+    p.add_argument("--prepare-mem", help="Memory per FASTA preparation task (default 16G)")
     p.add_argument("--array-batch-size", type=positive, default=1000,
                    help="Maximum tasks per SLURM array submission; larger panels are split into dependent batches")
     p.add_argument("--validate-genomes", action="store_true",
                    help="Scan every source FASTA for chromosome header compatibility before submission (slow on large panels)")
     p.add_argument("--graph-parallel", type=positive, default=1, help="Concurrent chromosome PGGB tasks")
-    p.add_argument("--partition")
-    p.add_argument("--account")
-    p.add_argument("--qos")
-    p.add_argument("--graph-mem", default="200G")
-    p.add_argument("--index-mem", default="256G")
-    p.add_argument("--align-mem", default="300G")
-    p.add_argument("--call-mem", default="128G")
-    p.add_argument("--phase-mem", default="128G")
-    p.add_argument("--consensus-mem", default="16G")
-    p.add_argument("--graph-time", default="48:00:00")
-    p.add_argument("--sample-time", default="72:00:00")
+    p.add_argument("--executor", choices=("auto", "local", "slurm"), default="auto",
+                   help="auto: use current SLURM allocation if present, otherwise submit to SLURM if available, otherwise local")
+    p.add_argument("--local-cpus", type=positive, help="CPU budget for local execution; cannot exceed available CPUs")
+    p.add_argument("--local-memory", help="Optional local total memory budget for scheduling (e.g. 128G; not an OS memory limit)")
+    p.add_argument("--partition", help="SLURM partition for submitted jobs")
+    p.add_argument("--account", help="SLURM account")
+    p.add_argument("--qos", help="SLURM quality of service")
+    p.add_argument("--constraint", help="SLURM node feature constraint")
+    p.add_argument("--reservation", help="SLURM reservation")
+    p.add_argument("--mail-user", help="SLURM notification email")
+    p.add_argument("--mail-type", help="SLURM notification events (e.g. FAIL)")
+    p.add_argument("--mem", help="Default memory per job/task (e.g. 128G)")
+    p.add_argument("--time", help="Default SLURM walltime per job (e.g. 24:00:00)")
+    for stage in ("graph", "index", "align", "call", "phase", "consensus"):
+        p.add_argument(f"--{stage}-mem", help=f"Memory per {stage} task; overrides --mem")
+    p.add_argument("--graph-time", help="SLURM walltime for prepare/graph/index (default 48:00:00)")
+    p.add_argument("--sample-time", help="SLURM walltime for align/call/phase/consensus (default 72:00:00)")
+    for option in ("mem", "time", "partition", "account", "qos"):
+        p.add_argument(f"--stage-{option}", action="append", default=[], metavar="STAGE=VALUE",
+                       help=f"Override {option} for a named stage; repeat as needed")
+    p.add_argument("--slurm-option", action="append", default=[], metavar="OPTION",
+                   help="Additional allowed sbatch option, e.g. --slurm-option=--exclusive or --slurm-option=--licenses=foo:1")
     p.add_argument("--dry-run", action="store_true", help="Validate input layout and reference headers; print plan without writing or submitting")
     # Same scientific defaults as the original graph workflow.
     p.add_argument("--segment-length", type=positive, default=20000)
@@ -233,17 +246,132 @@ def configuration(args):
             "chromosomes": chromosomes, "samples": samples, "options": options}
 
 
+def stage_overrides(items):
+    result = {}
+    for item in items:
+        stage, sep, value = item.partition("=")
+        require(sep and stage in STAGES and value.strip(),
+                f"Expected STAGE=VALUE (stages: {', '.join(STAGES)}): {item}")
+        require(stage not in result, f"Duplicate override for {stage}: {item}")
+        result[stage] = value
+    return result
+
+
+def memory_bytes(value):
+    # SLURM memory units are powers of 1024; bare values are MiB.
+    match = re.fullmatch(r"([1-9][0-9]*)([KMGT]?)", value, re.I)
+    require(match, f"Invalid memory value: {value}; use positive MiB or K/M/G/T (e.g. 128G)")
+    n, suffix = match.groups()
+    return int(n) * 1024 ** {"K": 1, "M": 2, "G": 3, "T": 4, "": 2}[suffix.upper()]
+
+
 def jobs(args, cfg):
-    return [
-        ("prepare", len(cfg["genomes"]), args.prepare_parallel, 1, args.prepare_mem, args.graph_time, True),
-        ("graph", len(cfg["chromosomes"]), args.graph_parallel, args.threads, args.graph_mem, args.graph_time, True),
-        ("index", 1, 1, args.threads, args.index_mem, args.graph_time, False),
-        ("align", len(cfg["samples"]), args.array, args.array_threads, args.align_mem, args.sample_time, True),
-        ("call", len(cfg["samples"]), args.array, args.array_threads, args.call_mem, args.sample_time, True),
-        ("phase", len(cfg["samples"]), args.array, args.array_threads, args.phase_mem, args.sample_time, True),
-        ("consensus", len(cfg["samples"]), args.array, args.array_threads, args.consensus_mem, args.sample_time, True),
-        ("finish", 1, 1, 1, "2G", "01:00:00", False),
-    ]
+    memory = stage_overrides(args.stage_mem)
+    duration = stage_overrides(args.stage_time)
+    defaults = {"prepare": "16G", "graph": "200G", "index": "256G", "align": "300G",
+                "call": "128G", "phase": "128G", "consensus": "16G", "finish": "2G"}
+    result = []
+    for stage, count, parallel, cpus, array in [
+        ("prepare", len(cfg["genomes"]), args.prepare_parallel, 1, True),
+        ("graph", len(cfg["chromosomes"]), args.graph_parallel, args.threads, True),
+        ("index", 1, 1, args.threads, False),
+        ("align", len(cfg["samples"]), args.array, args.array_threads, True),
+        ("call", len(cfg["samples"]), args.array, args.array_threads, True),
+        ("phase", len(cfg["samples"]), args.array, args.array_threads, True),
+        ("consensus", len(cfg["samples"]), args.array, args.array_threads, True),
+        ("finish", 1, 1, 1, False),
+    ]:
+        mem = memory.get(stage) or getattr(args, f"{stage}_mem", None) or args.mem or defaults[stage]
+        memory_bytes(mem)
+        if stage in ("prepare", "graph", "index"):
+            wall = args.graph_time or args.time or "48:00:00"
+        elif stage == "finish":
+            wall = args.time or "01:00:00"
+        else:
+            wall = args.sample_time or args.time or "72:00:00"
+        wall = duration.get(stage, wall)
+        require(re.fullmatch(r"(?:\d+(?:-\d+(?::\d{1,2}){0,2}|(?::\d{1,2}){0,2})|UNLIMITED|INFINITE)", wall, re.I),
+                f"Invalid SLURM walltime for {stage}: {wall}")
+        result.append((stage, count, parallel, cpus, mem, wall, array))
+    return result
+
+
+SLURM_KEYS = ("partition", "account", "qos", "constraint", "reservation", "mail_user", "mail_type")
+# Deliberately exclude options that override PACHA's dependency, array, CPU,
+# memory, log, working directory, environment, or command ownership.
+EXTRA_SLURM_OPTIONS = {
+    "--exclusive", "--licenses", "--nice", "--tmp", "--comment",
+    "--nodelist", "--exclude", "--prefer", "--wckey", "--gres", "--begin",
+}
+
+
+def extra_slurm_options(args):
+    for opt in args.slurm_option:
+        key, sep, val = opt.partition("=")
+        require(key in EXTRA_SLURM_OPTIONS and (key == "--exclusive" or (sep and val)),
+                f"Unsupported --slurm-option: {opt}; use named resource flags or an allocation")
+    return args.slurm_option
+
+
+def available_cpus():
+    try:
+        count = len(os.sched_getaffinity(0))
+    except AttributeError:
+        count = os.cpu_count() or 1
+    if os.environ.get("SLURM_JOB_ID"):
+        # Only the current task/node is used, not other nodes of an allocation.
+        # If cpus-per-task is absent, assume the conservative SLURM default of 1.
+        count = min(count, int(os.environ.get("SLURM_CPUS_PER_TASK", "1")))
+    return max(1, count)
+
+
+def configure_execution(args):
+    in_allocation = bool(os.environ.get("SLURM_JOB_ID"))
+    executor = args.executor
+    if executor == "auto":
+        if in_allocation:
+            executor = "local"
+        elif shutil.which("sbatch"):
+            executor = "slurm"
+        else:
+            executor = "local"
+    if executor == "local":
+        require(not any(getattr(args, k) for k in SLURM_KEYS) and
+                not any((args.time, args.graph_time, args.sample_time, args.stage_time,
+                         args.stage_partition, args.stage_account, args.stage_qos, args.slurm_option)),
+                "SLURM submission flags require --executor slurm. In an allocation, set them in #SBATCH directives.")
+        available = available_cpus()
+        budget = args.local_cpus or available
+        require(budget <= available, f"--local-cpus {budget} exceeds available CPUs ({available})")
+        args.threads = args.threads or min(16, budget)
+        args.array_threads = args.array_threads or min(8, budget)
+        args.array = args.array or 1
+        require(max(args.threads, args.array_threads) <= budget,
+                f"-t and -at must not exceed the local CPU budget ({budget}); reduce threads or request a larger allocation")
+        if args.local_memory:
+            memory_bytes(args.local_memory)
+        return executor, budget
+    require(not args.local_cpus and not args.local_memory,
+            "--local-cpus and --local-memory require --executor local (or auto resolving to local)")
+    args.threads = args.threads or 16
+    args.array_threads = args.array_threads or 8
+    args.array = args.array or 4
+    for key in ("partition", "account", "qos"):
+        stage_overrides(getattr(args, "stage_" + key))
+    extra_slurm_options(args)
+    return executor, None
+
+
+def local_concurrency(args, job, budget):
+    stage, count, parallel, cpus, mem, _, _ = job
+    require(cpus <= budget, f"{stage}: requires {cpus} CPUs but only {budget} available")
+    allowed = min(count, parallel, budget // cpus)
+    if args.local_memory:
+        memory = memory_bytes(args.local_memory)
+        per_task = memory_bytes(mem)
+        require(per_task <= memory, f"{stage}: memory estimate {mem} exceeds --local-memory {args.local_memory}; adjust estimates or budget")
+        allowed = min(allowed, memory // per_task)
+    return allowed
 
 
 def job_prefix(cfg):
@@ -258,9 +386,13 @@ def submit_command(args, cfg, job, worker, manifest, parent=None, offset=0):
            f"--cpus-per-task={cpus}", "--mem=" + mem, "--time=" + duration,
            "--output=" + str(log), "--error=" + str(log), "--export=ALL",
            "--chdir=" + cfg["output"]]
-    for key in ("partition", "account", "qos"):
-        if getattr(args, key):
-            cmd.append(f"--{key}={getattr(args, key)}")
+    for key in SLURM_KEYS:
+        value = getattr(args, key)
+        if key in ("partition", "account", "qos"):
+            value = stage_overrides(getattr(args, "stage_" + key)).get(stage, value)
+        if value:
+            cmd.append(f"--{key.replace('_', '-')}={value}")
+    cmd.extend(extra_slurm_options(args))
     if array:
         cmd.append(f"--array=0-{count-1}%{min(count, parallel)}")
     if parent:
@@ -285,17 +417,31 @@ def active_jobs(cfg):
     return [n for n in names.splitlines() if n.strip().startswith(job_prefix(cfg))]
 
 
-def print_plan(args, cfg):
+def print_plan(args, cfg, executor, budget):
     print(f"PACHA {VERSION} | graph | {len(cfg['genomes'])} haplotypes | {len(cfg['chromosomes'])} chromosomes | {len(cfg['samples'])} samples")
     print("Reference:", cfg["genomes"][cfg["reference_index"]]["path"])
     print("Output:", cfg["output"])
-    for stage, n, simultaneous, cpus, mem, duration, array in jobs(args, cfg):
-        batches = (n + args.array_batch_size - 1) // args.array_batch_size if array else 1
-        effective = min(n, simultaneous, args.array_batch_size) if array else 1
-        print(f"  {stage:12s} tasks={n:<5d} concurrent={effective:<4d} batches={batches:<4d} CPUs/task={cpus:<4d} memory={mem} time={duration}")
+    if executor == "local":
+        print(f"Execution: local on one node | CPU budget: {budget}" +
+              (" (existing SLURM allocation)" if os.environ.get("SLURM_JOB_ID") else ""))
+        print("Memory:", f"admission budget {args.local_memory} (estimates, not hard limits)" if args.local_memory
+              else "no memory admission budget; choose safe concurrency and sufficient physical RAM")
+    else:
+        print("Execution: submit dependent SLURM jobs (returns after submission)")
+    for job in jobs(args, cfg):
+        stage, n, simultaneous, cpus, mem, duration, array = job
+        if executor == "local":
+            effective = local_concurrency(args, job, budget)
+            print(f"  {stage:12s} tasks={n:<5d} concurrent={effective:<4d} CPUs/task={cpus:<4d} memory estimate={mem}")
+        else:
+            batches = (n + args.array_batch_size - 1) // args.array_batch_size if array else 1
+            effective = min(n, simultaneous, args.array_batch_size) if array else 1
+            partition = stage_overrides(args.stage_partition).get(stage, args.partition)
+            print(f"  {stage:12s} tasks={n:<5d} concurrent={effective:<4d} batches={batches:<4d} CPUs/task={cpus:<4d} memory={mem} time={duration}" +
+                  (f" partition={partition}" if partition else ""))
     print(f"Expected final FASTAs: {2 * len(cfg['samples'])} (hap1 + hap2 per individual)")
     if not args.validate_genomes:
-        print("Source FASTA chromosome validation will run in parallel on compute nodes.")
+        print("Source FASTA chromosome validation will run during parallel preparation.")
 
 
 def stage_dir(cfg, stage, index=0):
@@ -663,18 +809,31 @@ def finish(cfg, work, index, threads):
 WORKERS = dict(zip(STAGES, (prepare, graph, index_graph, align, call, phase, consensus, finish)))
 
 
-def worker(manifest, stage, threads, offset=0):
+def worker(manifest, stage, threads, offset=0, task_index=None):
     cfg = load(manifest)
     require(sha(__file__) == cfg["code_sha256"], "Worker snapshot differs from manifest")
-    index = offset + int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
+    index = task_index if task_index is not None else offset + int(os.environ.get("SLURM_ARRAY_TASK_ID", "0"))
     if stage in ("prepare", "graph", "align", "call", "phase", "consensus"):
         limit = len(cfg["genomes"] if stage == "prepare" else
                     cfg["chromosomes"] if stage == "graph" else cfg["samples"])
         require(0 <= index < limit, "Array index out of range")
     else:
         index = 0
-    require(threads <= int(os.environ.get("SLURM_CPUS_PER_TASK", str(threads))),
-            "Requested threads exceed SLURM allocation")
+    if task_index is None:
+        require(threads <= int(os.environ.get("SLURM_CPUS_PER_TASK", str(threads))),
+                "Requested threads exceed SLURM allocation")
+    else:
+        require(threads <= available_cpus(), "Requested threads exceed local CPU availability")
+    for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
+        os.environ[key] = str(threads)
+    lock_dir = Path(cfg["output"]) / ".pacha" / "tasklocks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    with open(lock_dir / f"{stage}-{index}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        execute_task(cfg, stage, index, threads)
+
+
+def execute_task(cfg, stage, index, threads):
     dest = stage_dir(cfg, stage, index)
     if receipt_ok(dest):
         print("Already completed:", dest)
@@ -698,13 +857,121 @@ def worker(manifest, stage, threads, offset=0):
         raise
 
 
+def terminate_local(processes):
+    # Each worker owns a process group, including its external bioinformatics
+    # children. Stop the group rather than just the Python wrapper.
+    for process in processes:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(p.poll() is None for p in processes):
+        time.sleep(0.1)
+    for process in processes:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+
+
+def local_stage(cfg, job, concurrency, snapshot, manifest):
+    stage, count, _, cpus, _, _, _ = job
+    running = {}
+    next_index = 0
+    failures = []
+    try:
+        while next_index < count or running:
+            while not failures and next_index < count and len(running) < concurrency:
+                i = next_index
+                next_index += 1
+                if receipt_ok(stage_dir(cfg, stage, i)):
+                    continue
+                log = Path(cfg["output"]) / "logs" / f"{stage}-{i}.local.log"
+                cmd = [sys.executable, str(snapshot), "_local_worker", str(manifest), stage, str(cpus), str(i)]
+                with open(log, "ab") as handle:
+                    handle.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} | {shlex.join(cmd)} ---\n".encode())
+                    handle.flush()
+                    process = subprocess.Popen(cmd, stdout=handle, stderr=subprocess.STDOUT,
+                                               cwd=cfg["output"], start_new_session=True)
+                running[i] = process
+                print(f"Started {stage}[{i}] (PID {process.pid}); log: {log}", flush=True)
+            for i, process in list(running.items()):
+                rc = process.poll()
+                if rc is None:
+                    continue
+                del running[i]
+                if rc != 0 or not receipt_ok(stage_dir(cfg, stage, i)):
+                    failures.append((i, rc))
+                    print(f"FAILED {stage}[{i}] (exit {rc}); inspect logs", file=sys.stderr, flush=True)
+                else:
+                    print(f"Completed {stage}[{i}]", flush=True)
+            if failures and not running:
+                break
+            if running:
+                time.sleep(0.2)
+        require(not failures, f"{stage} failed for tasks {failures}; downstream stages not started")
+        for i in range(count):
+            completed(cfg, stage, i)
+    finally:
+        if running:
+            terminate_local(list(running.values()))
+
+
+def run_local(args, cfg, budget, snapshot, manifest):
+    def interrupted(signum, frame):
+        raise KeyboardInterrupt
+    previous = signal.signal(signal.SIGTERM, interrupted)
+    try:
+        for job in jobs(args, cfg):
+            print(f"Running stage {job[0]} locally", flush=True)
+            local_stage(cfg, job, local_concurrency(args, job, budget), snapshot, manifest)
+        completed(cfg, "finish")
+        print("PACHA complete:", Path(cfg["output"]) / "results", flush=True)
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
+def run_slurm(args, cfg, snapshot, manifest, journal):
+    submitted = []
+    parent = None
+    # Record submission intent before the first sbatch; important for safe
+    # cross-executor restarts even if the launcher dies before recording an ID.
+    atomic_json(journal, submitted)
+    for job, offset in job_batches(args, cfg):
+        cmd = submit_command(args, cfg, job, snapshot, manifest, parent, offset)
+        # Do not accidentally inherit SBATCH_ARRAY_INX, SBATCH_WAIT,
+        # SBATCH_DEPENDENCY, etc. from a user's wrapper or shell.
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SBATCH_")}
+        reply = subprocess.check_output(cmd, text=True, env=env).strip()
+        ident = reply.split(";", 1)[0]
+        require(re.fullmatch(r"\d+", ident), f"Unexpected sbatch reply: {reply}")
+        parent = ident
+        submitted.append({"stage": job[0], "job_id": ident, "offset": offset, "task_count": job[1], "command": cmd})
+        atomic_json(journal, submitted)
+        print(f"Submitted {job[0]} (tasks {offset}..{offset + job[1] - 1}): {ident}", flush=True)
+    print("All jobs submitted. Monitor with squeue; logs:", Path(cfg["output"]) / "logs")
+    print("Final completion marker:", Path(cfg["output"]) / "results" / "_SUCCESS")
+
+
+def ensure_no_active_task_locks(state):
+    directory = state / "tasklocks"
+    if not directory.is_dir():
+        return
+    for path in directory.glob("*.lock"):
+        with open(path, "a") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise ValueError(f"A previous PACHA task is still running: {path.name}; wait or stop it before restarting")
+
+
 def launch(args):
+    executor, budget = configure_execution(args)
     cfg = configuration(args)
-    print_plan(args, cfg)
+    print_plan(args, cfg, executor, budget)
     if args.dry_run:
         return
-    missing = [t for t in (*TOOLS, "sbatch", "squeue") if shutil.which(t) is None]
-    require(not missing, "Missing tools (activate Conda environment and run on SLURM): " + ", ".join(missing))
+    needed = (*TOOLS, "sbatch", "squeue") if executor == "slurm" else TOOLS
+    missing = [t for t in needed if shutil.which(t) is None]
+    require(not missing, "Missing tools (activate the PACHA environment; SLURM commands needed only for --executor slurm): " + ", ".join(missing))
     out = Path(cfg["output"])
     if out.exists():
         require(out.is_dir(), "Output is not a directory")
@@ -717,8 +984,8 @@ def launch(args):
     (out / "logs").mkdir(exist_ok=True)
     with open(state / "launch.lock", "a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        require(not active_jobs(cfg), "This output already has active PACHA jobs; inspect squeue before relaunching")
         manifest, snapshot = state / "manifest.json", state / "worker.py"
+        journal = state / "jobs.json"
         if manifest.exists():
             require(load(manifest) == cfg, "Inputs, scientific settings, or PACHA version changed; use a new output directory")
             require(snapshot.is_file() and sha(snapshot) == cfg["code_sha256"], "Missing or changed worker snapshot")
@@ -731,22 +998,14 @@ def launch(args):
                     completed(cfg, stage, i)
             print("Run already complete:", out / "results")
             return
-        submitted = []
-        parent = None
-        journal = state / "jobs.json"
-        # Arrays use stage-wide afterok barriers, so the requested sample
-        # concurrency is never multiplied across alignment/call/phasing.
-        for job, offset in job_batches(args, cfg):
-            cmd = submit_command(args, cfg, job, snapshot, manifest, parent, offset)
-            reply = subprocess.check_output(cmd, text=True).strip()
-            ident = reply.split(";", 1)[0]
-            require(re.fullmatch(r"\d+", ident), f"Unexpected sbatch reply: {reply}")
-            parent = ident
-            submitted.append({"stage": job[0], "job_id": ident, "offset": offset, "task_count": job[1], "command": cmd})
-            atomic_json(journal, submitted)
-            print(f"Submitted {job[0]} (tasks {offset}..{offset + job[1] - 1}): {ident}", flush=True)
-        print("All jobs submitted. Monitor with squeue; logs:", out / "logs")
-        print("Final completion marker:", out / "results" / "_SUCCESS")
+        if executor == "slurm" or journal.exists():
+            require(shutil.which("squeue"), "Prior SLURM submissions exist; verify their terminal status on the original cluster before resuming")
+            require(not active_jobs(cfg), "This output already has active PACHA jobs; inspect squeue before relaunching")
+        ensure_no_active_task_locks(state)
+        if executor == "slurm":
+            run_slurm(args, cfg, snapshot, manifest, journal)
+        else:
+            run_local(args, cfg, budget, snapshot, manifest)
 
 
 def main(argv=None):
@@ -755,9 +1014,15 @@ def main(argv=None):
         if argv and argv[0] == "_worker":
             require(len(argv) == 5 and argv[2] in STAGES and int(argv[4]) >= 0, "Invalid internal worker invocation")
             worker(argv[1], argv[2], positive(argv[3]), int(argv[4]))
+        elif argv and argv[0] == "_local_worker":
+            require(len(argv) == 5 and argv[2] in STAGES and int(argv[4]) >= 0, "Invalid local worker invocation")
+            worker(argv[1], argv[2], positive(argv[3]), task_index=int(argv[4]))
         else:
             launch(parser().parse_args(argv))
         return 0
+    except KeyboardInterrupt:
+        print("PACHA interrupted; completed stages remain available for restart", file=sys.stderr)
+        return 130
     except (ValueError, OSError, subprocess.CalledProcessError, KeyError) as exc:
         print(f"PACHA ERROR: {exc}", file=sys.stderr)
         return 1

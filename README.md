@@ -2,9 +2,9 @@
 
 **Pangenome Aware Chromosome-level Haplotype Assembler**
 
-PACHA infers two reference-guided haplotype consensus sequences per diploid individual from paired-end short reads and chromosome-level haplotype assemblies. Version 0.2.1 requires an explicit reference FASTA and supports large input panels through parallel genome preparation and batched SLURM arrays. Graph mode is implemented; VCF mode is reserved and explicitly rejected.
+PACHA infers two reference-guided haplotype consensus sequences per diploid individual from paired-end short reads and chromosome-level haplotype assemblies. Version 0.3.0 supports local execution, automatic SLURM submission and execution inside a single existing SLURM allocation, with explicit reference selection and scalable source panels. Graph mode is implemented; VCF mode is reserved and explicitly rejected.
 
-## Installation (Linux, SLURM)
+## Installation (Linux)
 
 ```bash
 git clone https://github.com/Luna-san-2911/PACHA.git
@@ -15,36 +15,136 @@ export PATH="$PWD:$PATH"
 PACHA --help
 ```
 
-Add the absolute clone directory to PATH in your shell startup file if desired. SLURM (sbatch and squeue) must already be configured by your HPC administrator. The environment pins PGGB, VG and ODGI to the versions used together in the PGGB Bioconda recipe. The remaining dependencies use compatible version ranges; the environment is not a platform-independent lockfile.
+Add the absolute clone directory to PATH in your shell startup file if desired. Linux with sufficient storage, RAM and CPUs is required; SLURM is optional. The environment pins PGGB, VG and ODGI to the versions used together in the PGGB Bioconda recipe. The remaining dependencies use compatible version ranges; the environment is not a platform-independent lockfile.
 
-## One command
+## Quick start: choose how to run
+
+The scientific workflow is identical in every execution mode. The default --executor auto selects:
+
+| Environment | Automatic behavior |
+|---|---|
+| Existing SLURM allocation (sbatch/salloc) | Execute locally within the current allocation |
+| Outside an allocation, sbatch available | Submit dependent SLURM jobs/arrays |
+| No sbatch available | Run locally in the terminal |
+
+Specify --executor local or --executor slurm to override detection. The executor is independent of -m graph (the scientific method).
+
+### A. Local workstation or server without SLURM
 
 ```bash
-PACHA -m graph \
+PACHA --executor local -m graph \
   -r /path/to/reads \
   -g /path/to/genomes \
-  -t 32 -a 10 -at 16 \
-  -ref /path/to/reference/Patl.hap2.fa \
+  -ref /path/to/reference.fa \
+  -t 16 -a 2 -at 8 \
   -o /path/to/output
 ```
 
-The command discovers the inputs, validates the reference headers, creates a manifest and worker snapshot, and submits eight dependent stages (one or more SLURM jobs/arrays per stage). It returns after submission; jobs continue after logout. Use --dry-run to inspect the input layout and job plan without creating outputs or submitting jobs. Add --validate-genomes for an exhaustive chromosome-header preflight; otherwise source FASTA compatibility is validated on compute nodes during preparation, before any PGGB job can start.
+This runs in the foreground until completion or failure. No scheduler is required. Use a persistent terminal session (such as tmux) if disconnecting from a remote server. Local execution uses one node and caps concurrent tasks according to the CPU affinity/available CPU budget. If -t or -at exceeds the available budget, PACHA stops before starting work. For instance, on a 16-CPU machine, -a 10 -at 8 permits at most two concurrent sample tasks.
+
+For explicit memory-aware scheduling, add --local-memory 128G together with realistic estimates for every stage using --mem and --stage-mem. For example, if justified by a pilot dataset, use --mem 32G --stage-mem graph=96G --stage-mem index=96G. These values are admission-control estimates, not operating-system memory limits. Without --local-memory, PACHA does not enforce memory-based concurrency. Do not lower estimates simply to bypass resource checks. Large genomes may need far more RAM than a workstation has.
+
+### B. Submit the complete pipeline to SLURM
+
+Run on your cluster's submission/login node, with the Conda environment activated:
+
+```bash
+PACHA --executor slurm -m graph \
+  -r /path/to/reads \
+  -g /path/to/genomes \
+  -ref /path/to/reference.fa \
+  -t 32 -a 10 -at 16 \
+  -o /path/to/output \
+  --partition normal --account mylab --qos normal \
+  --time 48:00:00 --mem 128G \
+  --stage-mem graph=200G --stage-mem index=256G \
+  --stage-mem align=300G \
+  --stage-time align=72:00:00
+```
+
+Replace the example partition, account and QoS with actual site values; omit those that are unnecessary. PACHA submits dependent jobs and arrays, then returns. Jobs continue independently of the terminal. Each stage starts only after its preceding stage succeeds. CPU and memory requests are per task, not per array. Adjust the time limits to comply with your partition policy.
+
+### C. Run PACHA inside your own sbatch script
+
+Use this option if you want the entire pipeline contained within one SLURM allocation, using your own scheduler directives. Save as run_pacha.sbatch and adjust the paths and resource requests to suit your cluster and data.
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=PACHA
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=32
+#SBATCH --mem=256G
+#SBATCH --time=4-00:00:00
+#SBATCH --partition=normal
+#SBATCH --account=mylab
+#SBATCH --output=pacha-%j.log
+
+set -euo pipefail
+
+source /path/to/miniconda3/etc/profile.d/conda.sh
+conda activate pacha
+
+/path/to/PACHA/PACHA --executor local -m graph \
+  -r /path/to/reads \
+  -g /path/to/genomes \
+  -ref /path/to/reference.fa \
+  -t 32 -a 4 -at 8 \
+  -o /path/to/output \
+  --local-cpus 32 --local-memory 256G \
+  --mem 128G --stage-mem graph=200G \
+  --stage-mem index=256G --stage-mem align=128G
+```
+
+```bash
+sbatch run_pacha.sbatch
+```
+
+This does not submit child jobs. CPU budget is limited by SLURM_CPUS_PER_TASK and CPU affinity; the allocation must cover the full workflow runtime and peak memory. The example memory estimates must be validated for your dataset. SLURM enforces the allocation's actual memory and time limits; PACHA's local-memory option only limits simultaneous tasks according to estimates. Request one node and one task. Do not use srun with multiple tasks or launch PACHA as a SLURM array itself. If a site's maximum walltime is too short for the full pipeline, prefer option B; alternatively resubmit the same script to reuse completed tasks. A stage task that exceeds the walltime must be restarted.
+
+If you instead explicitly request --executor slurm inside a batch script, PACHA submits independent child jobs and exits after submission. The parent allocation does not supply resources to those jobs and its #SBATCH settings are not inherited by PACHA; pass the desired child resources on the command line. Avoid this approach unless the cluster permits nested submissions.
+
+## Command-line options
 
 | Flag | Meaning |
 |---|---|
 | -m | graph (implemented); vcf (future) |
 | -r | Directory containing paired-end FASTQ files |
 | -g | Directory containing one chromosome-level haplotype per FASTA |
-| -t | CPUs per chromosome graph job and graph indexing job |
-| -a | Maximum concurrent sample tasks in each sample array |
-| -at | CPUs requested per sample task |
+| -ref, --reference | **Required** reference FASTA path, inside or outside -g |
 | -o | Output directory (new or existing matching PACHA run) |
-| -ref, --reference | **Required** reference FASTA path, inside or outside -g; used as the graph, VCF, phasing and consensus backbone |
-| --prepare-parallel | Concurrent source FASTA preparation tasks (default 8) |
-| --array-batch-size | Maximum tasks per individual SLURM array submission (default 1000) |
-| --graph-parallel | Concurrent chromosome PGGB tasks (default 1) |
+| --executor | auto (default), local, slurm |
+| -t | CPUs per graph/index task (SLURM default 16; local default up to 16) |
+| -a | Maximum concurrent sample tasks (SLURM default 4; local default 1) |
+| -at | CPUs per sample task (SLURM default 8; local default up to 8) |
+| --prepare-parallel | Maximum concurrent source FASTA preparation tasks (default 8) |
+| --graph-parallel | Maximum concurrent chromosome PGGB tasks (default 1) |
+| --local-cpus | Total local CPU budget, at most available/allocated CPUs |
+| --local-memory | Optional total local RAM admission budget |
+| --array-batch-size | Maximum tasks per SLURM array (default 1000) |
+| --dry-run | Print execution plan without creating output or starting jobs |
+| --validate-genomes | Exhaustively validate source FASTA chromosome headers before starting |
 
-The reference is included in the pangenome exactly once by file identity: if it is outside -g and not already represented by the same file, it is added to the source panel. Symlink and hardlink aliases of the same file are recognized. Distinct files containing identical sequences are not collapsed, since they may represent different source haplotypes. No alphabetical reference fallback is used. Optional --partition, --account and --qos select site resources. Defaults use the cluster's own SLURM settings. Per-job memory defaults: preparation 16G, graph 200G, index 256G, align 300G, call/phase 128G, consensus 16G. Override with --prepare-mem, --graph-mem, --index-mem, --align-mem, --call-mem, --phase-mem, --consensus-mem. --graph-time and --sample-time adjust walltime. Sample stages run sequentially as arrays; e.g., -a 10 -at 16 permits at most 160 allocated CPUs during each sample stage. Some tools (notably WhatsHap phase and BCFtools consensus) are not fully multithreaded.
+The reference is included in the pangenome exactly once by file identity: if it is outside -g and not already represented by the same file, it is added to the source panel. Symlink and hardlink aliases are recognized; distinct files containing identical sequences are not collapsed. No alphabetical fallback is used.
+
+### SLURM resources
+
+| Option | Purpose |
+|---|---|
+| --partition, --account, --qos | Site-specific allocation and scheduling |
+| --mem, --time | Default memory and walltime for each task/job |
+| --stage-mem STAGE=VALUE | Per-stage memory override; repeat as needed |
+| --stage-time STAGE=VALUE | Per-stage walltime override |
+| --stage-partition STAGE=VALUE | Per-stage partition |
+| --stage-account STAGE=VALUE | Per-stage account |
+| --stage-qos STAGE=VALUE | Per-stage QoS |
+| --constraint, --reservation | Node features or reservation |
+| --mail-user, --mail-type | Optional scheduler email notifications |
+| --slurm-option=OPTION | Additional allowed sbatch options (e.g. --exclusive, --licenses=foo:1) |
+
+Stage names: prepare, graph, index, align, call, phase, consensus, finish. Memory precedence is --stage-mem, then --STAGE-mem (where provided), then --mem, then built-in defaults. Built-in per-task memory estimates/requests are prepare 16G, graph 200G, index 256G, align 300G, call/phase 128G, consensus 16G, finish 2G. Time precedence is --stage-time, then --graph-time (prepare/graph/index) or --sample-time (align/call/phase/consensus), then --time, then built-in defaults (48h graph group, 72h sample group, 1h finish). Local mode uses memory estimates but rejects SLURM-only submission flags; set those in your outer sbatch script instead. Additional allowed sbatch options are exclusive, licenses, nice, tmp, comment, nodelist, exclude, prefer, wckey, gres and begin. PACHA owns dependency, array, CPU, memory, logging, export and command options to prevent conflicting overrides. Some tools (notably WhatsHap phase and BCFtools consensus) are not fully multithreaded.
+
+Always start with --dry-run to review task counts, effective concurrency, resources and the chosen reference. It reads reference headers and discovers inputs without writing or submitting anything; full genome validation occurs during preparation unless --validate-genomes is supplied.
 
 ## Large pangenome panels
 
@@ -92,11 +192,11 @@ output/
     _SUCCESS
 ```
 
-Monitor with `squeue -u "$USER"` and `sacct` where enabled. Inspect logs and hidden .incomplete-* directories for failed tasks. _SUCCESS is created only after all sample consensus outputs pass validation. A stage is published via atomic directory rename and a receipt records expected output sizes. These receipts detect missing or size-changed files, not same-size corruption.
+For SLURM submission mode, monitor with `squeue -u "$USER"` and `sacct` where enabled. Local mode prints progress in the terminal and writes per-task logs under logs/. Inspect logs and hidden .incomplete-* directories for failed tasks. _SUCCESS is created only after all sample consensus outputs pass validation. A stage is published via atomic directory rename and a receipt records expected output sizes. These receipts detect missing or size-changed files, not same-size corruption.
 
 ### Restart
 
-After all prior jobs are terminal (cancel pending jobs with scancel if necessary), rerun the same command with the same output path. Completed stages are reused; failed unpublished stages restart. You may change scheduling resources but not inputs, scientific settings or the executable version. Do not manually delete individual completed intermediates; use a fresh run directory for changes (including a different reference or upgrade from v0.2.0) or corrupted outputs. A partial submission leaves already submitted jobs running; the launcher refuses a duplicate submission while matching jobs remain active.
+After all prior tasks are terminal (cancel pending SLURM jobs with scancel if necessary), rerun the same command with the same output path. Local mode exits nonzero on task failure and stops launching new tasks in that stage; already running tasks may finish. Ctrl+C/SIGTERM stops active local worker groups. A hard kill or node failure may leave orphan workers or incomplete temporary directories; verify prior tasks are stopped before restarting. Completed stages are reused; failed unpublished stages restart. You may change scheduling resources but not inputs, scientific settings or the executable version. Do not manually delete individual completed intermediates; use a fresh run directory for changes (including a different reference or executable version) or corrupted outputs. A partial submission leaves already submitted jobs running; the launcher refuses a duplicate submission while matching jobs remain active.
 
 ## Scientific limitations
 
@@ -108,5 +208,5 @@ These are **reference-guided chromosome-length consensus sequences**, not valida
 python -m unittest discover -s tests -v
 ```
 
-Unit tests cover required reference selection, external references, reference aliases, a synthetic 1,003-source panel, array batching, selected reference preparation, two outputs per individual, input discovery, command construction, dry run, receipts, consensus genotype selection and mocked SLURM submission. Real end-to-end validation requires the installed bioinformatics tools and a SLURM cluster. The original six research scripts are retained under legacy/ for provenance; they are not invoked by PACHA.
+Unit tests cover required reference selection, external references, reference aliases, a synthetic 1,003-source panel, array batching, selected reference preparation, two outputs per individual, input discovery, command construction, dry run, receipts, consensus genotype selection and mocked SLURM submission. Additional tests cover executor detection, allocated CPU limits, memory-aware concurrency, resource overrides, actual local subprocess orchestration using fake workers, restart, failure propagation and stage ordering. Real scientific end-to-end validation requires the installed bioinformatics tools; SLURM integration also requires a real cluster. The original six research scripts are retained under legacy/ for provenance; they are not invoked by PACHA.
 

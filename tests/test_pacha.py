@@ -30,7 +30,7 @@ class PipelineTests(unittest.TestCase):
                 (self.reads / f"{name}_R{mate}.fastq").write_text("@r\nACGT\n+\nIIII\n")
         for name in ("a.fa", "b.fa"):
             (self.genomes / name).write_text(">chr1\nACGT\n>chr2\nTGCA\n")
-        self.argv = ["-m", "graph", "-r", str(self.reads), "-g", str(self.genomes),
+        self.argv = ["--executor", "slurm", "-m", "graph", "-r", str(self.reads), "-g", str(self.genomes),
                      "-ref", str(self.genomes / "a.fa"),
                      "-t", "32", "-a", "2", "-at", "8", "-o", str(self.root / "out")]
 
@@ -158,7 +158,7 @@ class PipelineTests(unittest.TestCase):
 
     def test_vcf_mode_rejected(self):
         argv = list(self.argv)
-        argv[1] = "vcf"
+        argv[argv.index("-m") + 1] = "vcf"
         self.assertEqual(p.main(argv + ["--dry-run"]), 1)
 
     def test_consensus_genotypes(self):
@@ -194,6 +194,150 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(journal[-1]["stage"], "finish")
         self.assertEqual(journal[-1]["job_id"], "107")
         self.assertIn("--dependency=afterok:106", journal[-1]["command"])
+
+
+    def test_auto_executor_detection(self):
+        for env, sbatch, expected in [
+            ({}, None, "local"), ({}, "/bin/sbatch", "slurm"),
+            ({"SLURM_JOB_ID": "123", "SLURM_CPUS_PER_TASK": "64"}, "/bin/sbatch", "local"),
+        ]:
+            args = p.parser().parse_args(self.argv + ["--executor", "auto"])
+            with patch.dict(os.environ, env, clear=True), \
+                 patch.object(p.shutil, "which", return_value=sbatch), \
+                 patch.object(p, "available_cpus", return_value=64):
+                executor, budget = p.configure_execution(args)
+                self.assertEqual(executor, expected)
+                self.assertEqual(budget, 64 if expected == "local" else None)
+
+    def test_allocation_cpu_limit(self):
+        with patch.dict(os.environ, {"SLURM_JOB_ID": "99", "SLURM_CPUS_PER_TASK": "12"}, clear=True), \
+             patch.object(p.os, "sched_getaffinity", return_value=set(range(64))):
+            self.assertEqual(p.available_cpus(), 12)
+            args = p.parser().parse_args(self.argv + ["--executor", "local"])
+            with self.assertRaisesRegex(ValueError, "local CPU budget"):
+                p.configure_execution(args)
+
+    def test_local_default_threads(self):
+        args = p.parser().parse_args(["--executor", "local", "-m", "graph", "-r", str(self.reads),
+            "-g", str(self.genomes), "-ref", str(self.genomes / "a.fa"), "-o", str(self.root / "out")])
+        with patch.object(p, "available_cpus", return_value=4):
+            self.assertEqual(p.configure_execution(args), ("local", 4))
+        self.assertEqual((args.threads, args.array_threads, args.array), (4, 4, 1))
+
+    def test_local_concurrency_cpu_and_memory(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "local", "--local-cpus", "32",
+            "--local-memory", "64G", "--mem", "16G", "-a", "10"])
+        with patch.object(p, "available_cpus", return_value=64):
+            _, budget = p.configure_execution(args)
+        cfg = p.configuration(args)
+        align = next(j for j in p.jobs(args, cfg) if j[0] == "align")
+        self.assertEqual(p.local_concurrency(args, align, budget), 3)
+        self.assertEqual(p.local_concurrency(args, align, 16), 2)
+        args.local_memory = "16G"
+        self.assertEqual(p.local_concurrency(args, align, budget), 1)
+        args.local_memory = "8G"
+        with self.assertRaisesRegex(ValueError, "memory estimate"):
+            p.local_concurrency(args, align, budget)
+
+    def test_slurm_resource_overrides(self):
+        args = p.parser().parse_args(self.argv + ["--partition", "normal", "--account", "lab",
+            "--qos", "standard", "--time", "24:00:00", "--mem", "64G", "--align-mem", "96G",
+            "--stage-mem", "align=120G", "--stage-time", "align=2-00:00:00",
+            "--stage-partition", "align=bigmem", "--constraint", "amd",
+            "--mail-type", "FAIL", "--slurm-option=--exclusive"])
+        p.configure_execution(args)
+        cfg = p.configuration(args)
+        jobs = p.jobs(args, cfg)
+        align = next(j for j in jobs if j[0] == "align")
+        call = next(j for j in jobs if j[0] == "call")
+        self.assertEqual(align[4:6], ("120G", "2-00:00:00"))
+        self.assertEqual(call[4:6], ("64G", "24:00:00"))
+        cmd = p.submit_command(args, cfg, align, ROOT / "PACHA", self.root / "manifest")
+        for item in ("--partition=bigmem", "--account=lab", "--qos=standard",
+                     "--constraint=amd", "--exclusive", "--mail-type=FAIL"):
+            self.assertIn(item, cmd)
+
+    def test_local_rejects_slurm_submission_flags(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "local", "--partition", "normal"])
+        with self.assertRaisesRegex(ValueError, "require --executor slurm"):
+            p.configure_execution(args)
+
+    def test_unsafe_slurm_override_rejected(self):
+        args = p.parser().parse_args(self.argv + ["--slurm-option=--array=0-4"])
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            p.configure_execution(args)
+
+    def test_local_launch_does_not_require_slurm(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "local"])
+        def which(name):
+            return "/bin/tool" if name in p.TOOLS else None
+        with patch.object(p.shutil, "which", side_effect=which), \
+             patch.object(p, "available_cpus", return_value=64), \
+             patch.object(p, "run_local") as run, \
+             patch.object(p, "active_jobs") as queue:
+            p.launch(args)
+        run.assert_called_once()
+        queue.assert_not_called()
+        self.assertFalse((self.root / "out" / ".pacha" / "jobs.json").exists())
+
+    def fake_local_worker(self, cfg, fail=False):
+        out = pathlib.Path(cfg["output"])
+        out.mkdir()
+        (out / "logs").mkdir()
+        manifest = out / "manifest.json"
+        p.atomic_json(manifest, cfg)
+        script = out / "fake_worker.py"
+        script.write_text(
+            "import json, pathlib, sys\n"
+            "_, _, manifest, stage, threads, index = sys.argv\n"
+            "cfg = json.loads(pathlib.Path(manifest).read_text())\n"
+            "i = int(index)\n"
+            + ("if i == 0: sys.exit(7)\n" if fail else "") +
+            "d = pathlib.Path(cfg['output']) / '00_inputs' / cfg['genomes'][i]['id']\n"
+            "d.mkdir(parents=True)\n"
+            "(d / 'data').write_text('ok')\n"
+            "(d / '.complete.json').write_text(json.dumps({'files': {'data': 2}}))\n"
+        )
+        return script, manifest
+
+    def test_local_real_subprocesses_and_resume(self):
+        args = p.parser().parse_args(self.argv)
+        cfg = p.configuration(args)
+        script, manifest = self.fake_local_worker(cfg)
+        job = p.jobs(args, cfg)[0]
+        p.local_stage(cfg, job, 2, script, manifest)
+        for i in range(2):
+            self.assertTrue(p.receipt_ok(p.stage_dir(cfg, "prepare", i)))
+        log = pathlib.Path(cfg["output"]) / "logs" / "prepare-0.local.log"
+        before = log.read_bytes()
+        p.local_stage(cfg, job, 2, script, manifest)
+        self.assertEqual(log.read_bytes(), before)
+
+    def test_local_failure_stops_new_tasks(self):
+        args = p.parser().parse_args(self.argv)
+        cfg = p.configuration(args)
+        script, manifest = self.fake_local_worker(cfg, fail=True)
+        with self.assertRaisesRegex(ValueError, "downstream stages not started"):
+            p.local_stage(cfg, p.jobs(args, cfg)[0], 1, script, manifest)
+        self.assertFalse(p.stage_dir(cfg, "prepare", 1).exists())
+        self.assertFalse((pathlib.Path(cfg["output"]) / "logs" / "prepare-1.local.log").exists())
+
+    def test_local_stage_order(self):
+        args = p.parser().parse_args(self.argv + ["--executor", "local"])
+        cfg = p.configuration(args)
+        with patch.object(p, "local_stage") as runner, patch.object(p, "completed"):
+            p.run_local(args, cfg, 32, ROOT / "PACHA", self.root / "manifest")
+        self.assertEqual([call.args[1][0] for call in runner.call_args_list], list(p.STAGES))
+
+    def test_local_worker_ignores_inherited_array_index(self):
+        cfg = p.configuration(p.parser().parse_args(self.argv))
+        manifest = self.root / "manifest"
+        p.atomic_json(manifest, cfg)
+        with patch.dict(os.environ, {"SLURM_ARRAY_TASK_ID": "99"}, clear=True), \
+             patch.object(p, "available_cpus", return_value=8), \
+             patch.object(p, "execute_task") as task:
+            p.worker(manifest, "prepare", 1, task_index=1)
+        task.assert_called_once_with(cfg, "prepare", 1, 1)
 
 
 if __name__ == "__main__":
